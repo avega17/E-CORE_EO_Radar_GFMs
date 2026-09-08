@@ -1,0 +1,40 @@
+
+# Update the host system package list and the base Conda installer
+sudo apt update -y
+conda update -n base -c defaults conda -y
+
+# Create the lean, isolated data environment and activate it
+conda create -n pr-rain-data python=3.11 --no-default-packages -y
+conda activate pr-rain-data
+
+conda deactivate
+conda env remove --name pr-rain-data
+
+# Install the unified geospatial, AWS, Microsoft STAC, and NASA stack
+conda install -c conda-forge \
+    gdal \
+    rioxarray \
+    netcdf4 \
+    dask \
+    pyresample \
+    pystac-client \
+    odc-stac \
+    earthaccess \
+    boto3 \
+    s3fs \
+    -y
+    
+pip install planetary_computer
+
+pip install matplotlib
+
+
+You can do the following:
+--------------------------
+conda install -c conda-forge gdal rioxarray netcdf4 dask pyresample pystac-client odc-stac earthaccess s3fs boto3 -y
+
+pip install herbie-data planetary_computer matplotlib
+
+conda install -c conda-forge cartopy -y
+
+
