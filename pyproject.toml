@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecore-weather"
+version = "0.1.0"
+description = "Small research tools for NOAA MRMS and GOES subsets"
+requires-python = ">=3.12"
+
+# Conda users install environment.yml. This extra is for Colab's existing Python.
+[project.optional-dependencies]
+notebooks = [
+  "numpy>=2,<3", "pandas>=2.2,<3", "xarray==2026.7.0", "dask[array]",
+  "eccodes", "cfgrib", "rasterio", "rioxarray", "pyproj", "h5py",
+  "h5netcdf", "netCDF4", "cartopy>=0.24,<0.26", "matplotlib", "requests", "boto3", "s3fs==2026.7.0",
+  "zarr==3.3.0", "pystac>=1.12,<2", "jupytext", "ipywidgets", "ipyleaflet>=0.19,<0.21", "tqdm", "pillow", "ipykernel",
+  "psutil", "python-dotenv", "obstore==0.11.1", "virtualizarr==2.7.3",
+  "kerchunk==0.2.10", "huggingface_hub==1.30.0",
+]
+test = ["pytest", "nbclient"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.jupytext]
+formats = "ipynb,py:percent"
+

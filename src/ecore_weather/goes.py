@@ -1,0 +1,366 @@
+"""GOES CMI imagery: select bands and a native-grid window before loading."""
+
+from __future__ import annotations
+
+import json
+import re
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+from pyproj import CRS, Transformer
+
+from .common import (Asset, PR_BBOX, Selection, Transport, digest, hours, iso,
+                     jsonable, list_objects, remote_file, s3_client, utc, validate_request, write_json)
+
+PRODUCTS = ("ABI-L2-MCMIPF", "ABI-L2-MCMIPC", "ABI-L2-CMIPF", "ABI-L2-CMIPC")
+
+
+def east_satellite(start, end):
+    # NOAA operational notice: MSG_20250407_1510.html.
+    transition = utc("2025-04-07T15:10:00Z")
+    if utc(start) < transition < utc(end):
+        raise ValueError("Split a GOES-East request at the GOES-16/19 transition, or choose a satellite explicitly.")
+    return 19 if utc(start) >= transition else 16
+
+
+def scan_time(text):
+    return datetime.strptime(text[:13], "%Y%j%H%M%S").replace(
+        tzinfo=timezone.utc, microsecond=int(text[13:].ljust(6, "0") or 0))
+
+
+def discover(start, end, bbox=PR_BBOX, bands=(8, 13), satellite="auto", product="ABI-L2-MCMIPF"):
+    start, end, bbox = validate_request(start, end, bbox)
+    satellite = east_satellite(start, end) if satellite == "auto" else int(satellite)
+    if product not in PRODUCTS:
+        raise ValueError(f"Supported CMI products: {', '.join(PRODUCTS)}")
+    bands = tuple(sorted(set(map(int, bands))))
+    if not bands or any(b < 1 or b > 16 for b in bands):
+        raise ValueError("Select one or more ABI bands from 1 to 16.")
+    if satellite not in (16, 17, 18, 19):
+        raise ValueError("Select GOES-16, 17, 18, or 19.")
+    client = s3_client()
+    bucket = f"noaa-goes{satellite}"
+
+    def listing(hour):
+        return list(list_objects(bucket, f"{product}/{hour:%Y/%j/%H}/", client))
+
+    candidates = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for objects in pool.map(listing, hours(start, end)):
+            for obj in objects:
+                key = obj["Key"]
+                match = re.search(r"_s(\d+)_e(\d+)_c(\d+)\.nc$", key)
+                if not match:
+                    continue
+                when, until = scan_time(match[1]), scan_time(match[2])
+                band_match = re.search(r"-M\dC(\d\d)_", key)
+                band = int(band_match[1]) if band_match else None
+                if band is not None and band not in bands:
+                    continue
+                if start <= when < end:
+                    # Keep the newest processing of a scan if duplicates are listed.
+                    identity = (when, band)
+                    asset = Asset(bucket, key, obj["Size"], obj["ETag"].strip('"'), iso(when), iso(until))
+                    if identity not in candidates or key > candidates[identity].key:
+                        candidates[identity] = asset
+    return Selection("goes", product, iso(start), iso(end), bbox,
+                     sorted(candidates.values(), key=lambda a: (a.time, a.key)), bands=bands, satellite=satellite)
+
+
+def acquisition_coverage(selection):
+    """Expected versus observed slots for the supported full-disk/CONUS modes."""
+    from collections import defaultdict
+    by_hour = defaultdict(list)
+    for asset in selection.assets:
+        by_hour[utc(asset.time).replace(minute=0, second=0, microsecond=0)].append(asset)
+    rows = []
+    for hour in hours(selection.start, selection.end):
+        assets = by_hour[hour]
+        modes = {re.search(r"-M(\d)", a.key)[1] for a in assets}
+        if selection.product.endswith("C"):
+            expected = 12
+        elif modes == {"6"}:
+            expected = 6
+        elif modes == {"3"}:
+            expected = 4
+        else:
+            expected = None
+        multiplier = len(selection.bands) if "MCMIP" not in selection.product else 1
+        rows.append({"hour": iso(hour), "observed_files": len(assets),
+                     "scan_modes": ",".join(sorted(modes)),
+                     "expected_files": expected * multiplier if expected else None,
+                     "note": "" if expected else "Missing-file count not inferred for absent, mixed, or unsupported scan modes."})
+    return pd.DataFrame(rows)
+
+
+def _physical_coordinate(var):
+    return var.values.astype("float64") * var.attrs.get("scale_factor", 1) + var.attrs.get("add_offset", 0)
+
+
+def projection(ds):
+    attrs = ds["goes_imager_projection"].attrs
+    return CRS.from_cf(attrs), float(attrs["perspective_point_height"])
+
+
+def native_window(ds, bbox, halo=0):
+    crs, height = projection(ds)
+    transform = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    left, bottom, right, top = transform.transform_bounds(*bbox, densify_pts=41)
+    if not np.isfinite([left, bottom, right, top]).all():
+        raise ValueError("Part of the requested region is outside the satellite view.")
+    x = _physical_coordinate(ds.x) * height
+    y = _physical_coordinate(ds.y) * height
+    if left < x.min() or right > x.max() or bottom < y.min() or top > y.max():
+        raise ValueError("The requested region is outside this sector. Try full disk or a smaller region.")
+    xi, yi = np.flatnonzero((x >= left) & (x <= right)), np.flatnonzero((y >= bottom) & (y <= top))
+    if not len(xi) or not len(yi):
+        raise ValueError("The region contains no source pixels.")
+    return {"x": slice(max(0, xi.min()-halo), min(len(x), xi.max()+1+halo)),
+            "y": slice(max(0, yi.min()-halo), min(len(y), yi.max()+1+halo))}
+
+
+def selected_variables(ds, bands):
+    if "CMI" in ds:
+        band = int(ds.band_id.values.item())
+        if band not in bands:
+            raise ValueError("The single-band file does not contain a requested band.")
+        names = ["CMI", "DQF", "band_id", "band_wavelength"]
+    else:
+        names = [f"{prefix}_C{b:02d}" for b in bands for prefix in ("CMI", "DQF")]
+        missing = [name for name in names if name not in ds]
+        if missing:
+            raise ValueError(f"The file is missing requested variables: {missing}")
+        names += [name for name in ds.variables if any(name.endswith(f"_C{b:02d}") for b in bands) and ds[name].ndim == 0]
+    names += ["goes_imager_projection", "t"]
+    for name in names:
+        if name in ds:
+            for attr in ("coordinates", "bounds", "grid_mapping"):
+                names.extend(n for n in str(ds[name].attrs.get(attr, "")).split() if n in ds and n not in names)
+    return list(dict.fromkeys(n for n in names if n in ds))
+
+
+def subset_dataset(ds, bbox, bands):
+    window = native_window(ds, bbox)
+    return ds[selected_variables(ds, bands)].isel(window).load()
+
+
+def read(asset, bbox=PR_BBOX, bands=(8, 13), transport=None, full_file=False):
+    if transport is None:
+        with Transport() as owned:
+            return read(asset, bbox, bands, owned, full_file)
+    before = time.perf_counter()
+    if full_file:
+        with tempfile.TemporaryDirectory(prefix="ecore-goes-") as temp:
+            path = Path(temp) / "source.nc"
+            path.write_bytes(transport.read(asset))
+            if path.stat().st_size != asset.size:
+                raise IOError("Incomplete source download.")
+            with xr.open_dataset(path, engine="h5netcdf", decode_cf=False, mask_and_scale=False) as ds:
+                subset = subset_dataset(ds, bbox, bands)
+    else:
+        with remote_file(asset, transport) as source:
+            with xr.open_dataset(source, engine="h5netcdf", decode_cf=False, mask_and_scale=False) as ds:
+                subset = subset_dataset(ds, bbox, bands)
+    elapsed = time.perf_counter() - before
+    subset.attrs.update(source_url=asset.url, source_etag=asset.etag,
+                        observation_time=asset.time, scan_end=asset.end_time, requested_bbox=list(bbox))
+    return subset, {"read_decode_crop_s": elapsed}
+
+
+def decode(ds):
+    """A new, physically decoded view. Packed raw arrays remain unchanged."""
+    return xr.decode_cf(ds.copy(deep=True))
+
+
+def science_variables(ds):
+    return [name for name in ds.data_vars if name == "CMI" or name.startswith("CMI_C")]
+
+
+def process(ds, variable="CMI_C13", mask_quality=True, reproject=False, bbox=PR_BBOX, shape=(768, 768)):
+    import rioxarray  # noqa: F401
+    from rasterio.enums import Resampling
+    from rasterio.transform import from_bounds
+    decoded = decode(ds)
+    arr = decoded[variable]
+    flag = variable.replace("CMI", "DQF")
+    if mask_quality and flag in ds:
+        arr = arr.where(decoded[flag] == 0)
+    if not reproject:
+        return arr
+    crs, height = projection(ds)
+    arr = arr.assign_coords(x=_physical_coordinate(ds.x)*height, y=_physical_coordinate(ds.y)*height)
+    arr = arr.rio.write_crs(crs).rio.write_nodata(np.nan)
+    return arr.rio.reproject("EPSG:4326", shape=shape, transform=from_bounds(*bbox, shape[1], shape[0]),
+                             resampling=Resampling.bilinear)
+
+
+def lonlat(ds):
+    crs, height = projection(ds)
+    x, y = np.meshgrid(_physical_coordinate(ds.x)*height, _physical_coordinate(ds.y)*height)
+    return Transformer.from_crs(crs, "EPSG:4326", always_xy=True).transform(x, y)
+
+
+def benchmark_assets(selection):
+    """Actual scans nearest midnight/noon on first, middle, final included days.
+
+    Partial-day requests use the available scans in that day. Single-band products
+    retain each requested band; duplicate choices from short windows are removed.
+    """
+    first = utc(selection.start).replace(hour=0, minute=0, second=0, microsecond=0)
+    last = utc(selection.end) - timedelta(microseconds=1)
+    days = (last.date() - first.date()).days + 1
+    picked = {}
+    for day in sorted({0, days//2, days-1}):
+        date = (first + timedelta(days=day)).date()
+        available = [a for a in selection.assets if utc(a.time).date() == date]
+        groups = {}
+        for asset in available:
+            band = re.search(r"-M\dC(\d\d)_", asset.key)
+            groups.setdefault(band[1] if band else "multiband", []).append(asset)
+        for hour in (0, 12):
+            target = first + timedelta(days=day, hours=hour)
+            for candidates in groups.values():
+                asset = min(candidates, key=lambda a: (abs((utc(a.time)-target).total_seconds()), a.time, a.key))
+                picked[asset.id] = asset
+    return sorted(picked.values(), key=lambda a: (a.time, a.key))
+
+
+def build_virtual(selection, directory, assets=None):
+    """Write Kerchunk references with VirtualiZarr, grouping matching encodings.
+
+    References describe full native variables. The small index records the crop,
+    applied lazily when opened; no local legacy files are needed or retained.
+    """
+    from obstore.store import S3Store
+    from obspec_utils.registry import ObjectStoreRegistry
+    from virtualizarr import open_virtual_dataset
+    from virtualizarr.parsers import HDFParser
+    start = time.perf_counter()
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    groups, records = {}, []
+    for asset in assets if assets is not None else selection.assets:
+        bucket_url = f"s3://{asset.bucket}"
+        registry = ObjectStoreRegistry({bucket_url: S3Store(asset.bucket, region="us-east-1", skip_signature=True)})
+        with open_virtual_dataset(f"{bucket_url}/{asset.key}", registry=registry, parser=HDFParser(),
+                                  loadable_variables=["x", "y", "t", "goes_imager_projection"] +
+                                  (["band_id", "band_wavelength"] if "MCMIP" not in selection.product else []), decode_times=False) as vds:
+            names = selected_variables(vds, selection.bands)
+            chosen = vds[names]
+            chosen = chosen.drop_vars([n for n in chosen.variables if n not in names and n not in {"x", "y"}])
+            # VirtualiZarr's loadable path applies CF decoding, and its HDF parser
+            # can omit compact scalar payloads. Inline these small raw variables
+            # from h5netcdf; the large image arrays remain remote references.
+            with Transport() as metadata_transport, remote_file(asset, metadata_transport) as source:
+                with xr.open_dataset(source, engine="h5netcdf", decode_cf=False) as raw:
+                    for name in list(chosen.variables):
+                        if raw[name].ndim < 2:
+                            small = raw[name].load().copy(deep=True)
+                            small.encoding = {}
+                            if "_FillValue" not in small.attrs:
+                                small.encoding["_FillValue"] = None
+                            chosen[name] = small
+                    chosen.attrs = dict(raw.attrs)
+            signature = {name: {"shape": chosen[name].shape, "dtype": str(chosen[name].dtype),
+                                # Per-scan quality percentages are observations,
+                                # not changes in the flag schema. Each reference
+                                # retains them, but they do not split a group.
+                                "attrs": jsonable({k: v for k, v in chosen[name].attrs.items()
+                                                   if not (k.startswith("percent_") and k.endswith("_qf"))}),
+                                "encoding": str(getattr(chosen[name].data, "metadata", ""))}
+                         for name in names if chosen[name].ndim > 0}
+            signature["projection"] = jsonable(chosen.goes_imager_projection.attrs)
+            if "band_id" in chosen:
+                signature["band_id_value"] = jsonable(chosen.band_id.values)
+                signature["band_wavelength_value"] = jsonable(chosen.band_wavelength.values)
+            signature["x"] = digest(jsonable(chosen.x.values))
+            signature["y"] = digest(jsonable(chosen.y.values))
+            group = digest(signature)
+            references = chosen.vz.to_kerchunk(format="dict")
+            # VirtualiZarr 2.7.3 writes inline scalars at "name/"; Zarr v2
+            # requires "name/0". Correct the key, keeping the payload unchanged.
+            for name in chosen.variables:
+                if chosen[name].ndim == 0 and f"{name}/" in references["refs"]:
+                    references["refs"][f"{name}/0"] = references["refs"].pop(f"{name}/")
+            groups.setdefault(group, []).append(asset.id)
+            records.append({"id": asset.id, "reference": references, "source_url": asset.url, "etag": asset.etag,
+                            "size": asset.size, "time": asset.time, "group": group})
+    index = {"selection_id": selection.id, "bbox": selection.bbox, "bands": selection.bands,
+             "groups": groups, "records": records, "build_s": time.perf_counter()-start,
+             "reference_bytes": sum(len(json.dumps(r["reference"])) for r in records)}
+    write_json(directory / "index.json", index)
+    return directory / "index.json"
+
+
+def open_virtual(index_path, record=0):
+    """Open one selected reference lazily; do not download full source files."""
+    import fsspec
+    index_path = Path(index_path)
+    index = json.loads(index_path.read_text())
+    entry = index["records"][record]
+    from urllib.parse import urlparse
+    source = urlparse(entry["source_url"])
+    bucket, key = source.netloc.split(".s3.")[0], source.path.lstrip("/")
+    info = s3_client().head_object(Bucket=bucket, Key=key, IfMatch=f'"{entry["etag"]}"')
+    if info["ContentLength"] != entry["size"]:
+        raise IOError("The referenced NOAA object changed size. Rebuild the selection and references.")
+    reference = entry.get("reference")
+    if reference is None:
+        reference = json.loads((index_path.parent / entry["file"]).read_text())
+    fs = fsspec.filesystem("reference", fo=reference, remote_protocol="s3", skip_instance_cache=True,
+                          remote_options={"anon": True, "asynchronous": True, "skip_instance_cache": True}, asynchronous=True)
+    ds = xr.open_dataset(fs.get_mapper(""), engine="zarr", consolidated=False,
+                         decode_cf=False, mask_and_scale=False, chunks={})
+    closed = False
+    def close():
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        ds.close()
+        remote = fs.fss["s3"]
+        creator = getattr(remote, "_s3creator", None)
+        if creator is not None:
+            from zarr.core.sync import sync
+            sync(creator.__aexit__(None, None, None))
+    try:
+        subset = ds[selected_variables(ds, index["bands"])].isel(native_window(ds, index["bbox"]))
+        subset.attrs.update(source_url=entry["source_url"], source_etag=entry["etag"],
+                            observation_time=entry["time"], requested_bbox=index["bbox"])
+        subset.set_close(close)
+        return subset
+    except Exception:
+        close()
+        raise
+
+
+def open_virtual_group(index_path, group=None):
+    """Lazily concatenate one compatible group along an explicit scan dimension."""
+    index = json.loads(Path(index_path).read_text())
+    if group is None:
+        if len(index["groups"]) != 1:
+            raise ValueError("Choose a group explicitly; these files have different encodings or grids.")
+        group = next(iter(index["groups"]))
+    if group not in index["groups"]:
+        raise KeyError(group)
+    opened = []
+    try:
+        for i, record in enumerate(index["records"]):
+            if record["group"] == group:
+                ds = open_virtual(index_path, i)
+                opened.append(ds)
+        combined = xr.concat(opened, dim=pd.Index([r["time"] for r in index["records"]
+                            if r["group"] == group], name="scan"), join="exact", compat="equals",
+                            coords="minimal", combine_attrs="drop_conflicts")
+        combined.set_close(lambda: [ds.close() for ds in opened])
+        return combined
+    except Exception:
+        for ds in opened:
+            ds.close()
+        raise

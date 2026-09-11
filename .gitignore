@@ -1,3 +1,6 @@
+# Project specific
+docs/evidence/*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -149,6 +152,9 @@ activemq-data/
 
 # Environments
 .env
+.conda/
+data/
+artifacts/
 .envrc
 .venv
 env/
@@ -216,3 +222,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+results/
+figures/
