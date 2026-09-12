@@ -58,6 +58,44 @@ def observation(folder, marker):
             'dataset':group,'asset_id':marker.get('asset_id')}
 
 
+def months_available(location, source=None):
+    """Coarse month availability for a LOCAL archive: which YYYY/MM folders exist.
+
+    Reads only year/month directory names (no completion markers, no chunk
+    walks), so it is cheap enough to show before the first Find. Returns a sorted
+    list of 'YYYY-MM' strings. Remote (hf://) locations return an empty list:
+    listing months there is not cheap, and the Find search reports availability.
+    """
+    import re
+    location = str(location).rstrip('/')
+    if location.startswith('hf://') or location.endswith(('.zarr', '.zarr.zip')):
+        return []
+    root = Path(location).expanduser()
+    if source and (root/source).is_dir():
+        root = root/source
+    if not root.is_dir():
+        return []
+    months = set()
+    year = re.compile(r'(19|20)\d{2}')
+    month = re.compile(r'(0[1-9]|1[0-2])')
+    for directory, folders, _ in os.walk(root):
+        keep = []
+        for f in folders:
+            if f == 'raw.zarr':
+                continue
+            if year.fullmatch(f):
+                # Read this year's month subfolders, then do not descend into it.
+                try:
+                    months |= {f'{f}-{m.name}' for m in (Path(directory)/f).iterdir()
+                               if m.is_dir() and month.fullmatch(m.name)}
+                except OSError:
+                    pass
+                continue
+            keep.append(f)
+        folders[:] = keep
+    return sorted(months)
+
+
 def inventory(location, source=None, start=None, end=None, band=None, limit=50000):
     """Date/source filtering precedes the result limit; only completed stores count."""
     start=utc(start) if start else None;end=utc(end) if end else None
@@ -126,7 +164,7 @@ def inventory(location, source=None, start=None, end=None, band=None, limit=5000
 
 def daily_sample(records, count=4):
     import numpy as np
-    if not 4<=count<=8:raise ValueError('Choose 4–8 images per day.')
+    if not 1<=count<=24:raise ValueError('Choose 1–24 images per day.')
     days={}
     for row in records:days.setdefault(row['time'][:10],[]).append(row)
     return [rows[i] for _,rows in sorted(days.items()) for i in np.unique(np.linspace(0,len(rows)-1,min(count,len(rows)),dtype=int))]

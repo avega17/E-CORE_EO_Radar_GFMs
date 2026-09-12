@@ -54,6 +54,36 @@ Evidence is consolidated in [weekly-summary.json](evidence/weekly-summary.json).
 It retains timing rows, raw-storage totals, patch summaries, equality outcomes,
 and the HF publish/resume result. Detailed successful-test artifacts were removed.
 
+## GOES read throughput and block size
+
+An H2 2022 GOES run at 8 bands and 6 full-disk scans per hour was tracking
+roughly 1.75 s per file (about 12.6 h projected for ~26,000 scans). We measured
+whether the fetch, not NOAA, was the limit by re-fetching one UTC day of GOES-16
+MCMIPF 8-band scans (48 files) into temporary local Zarr stores, varying the
+S3 backend, the range-read block size, and the worker count. Every variant
+produced identical subset fingerprints, so the differences are speed, not
+content. Two repeats each; wall time in seconds:
+
+| Backend | Block | Workers | Wall (s) | vs baseline |
+| --- | --- | --- | --- | --- |
+| s3fs | 256 KB | 8 | 110.9 | — |
+| obstore | 256 KB | 8 | 109.9 | −1% |
+| obstore | 1 MB | 8 | 93.3 | −16% |
+| obstore | 1 MB | 16 | **72.8** | **−34%** |
+| obstore | 4 MB | 16 | 83.7 | −25% |
+
+Summed per-file seconds show the dominant stage is the source read
+(~620 s across 8 workers at 256 KB), not local writes or publishing
+(~13 s publish). Larger 1 MB blocks cut read time about a third; 4 MB blocks
+regressed, consistent with HDF5 reads over-fetching at very large block sizes.
+The default GOES range-read block is now 1 MB, overridable in code.
+
+Anonymous NOAA S3 documents no per-client rate cap at these levels. The observed
+10–20 Mb/s on a much faster link is consistent with many small (256 KB)
+latency-bound GET requests across a bounded worker pool, not throttling;
+integrity `IfMatch` checks are kept on every read. These are single-day,
+cache-sensitive measurements, not a sustained-load guarantee.
+
 ## Expanded checks and interfaces
 
 The current periods are September 1–December 1 in 2022 and 2025, end excluded.

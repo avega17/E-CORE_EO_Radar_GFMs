@@ -38,6 +38,7 @@ def parser(source):
     else:
         p.add_argument("--satellite", choices=["auto", "16", "17", "18", "19"], default="auto")
         p.add_argument("--bands", nargs="+", type=int, default=[8, 13])
+        p.add_argument("--scans-per-hour", type=int, default=1, metavar="N", help="Scans to keep per UTC hour (1-6); 0 keeps every available scan")
     return p
 
 
@@ -62,7 +63,11 @@ def main(source, argv=None):
             if source == "mrms":
                 selection = mrms.discover(**request, tolerance_minutes=args.tolerance_minutes, time_match=args.time_match)
             else:
-                selection = goes.discover(**request, satellite=args.satellite, bands=args.bands)
+                # Validation and benchmark runs keep every available scan explicitly.
+                scans = args.scans_per_hour or None
+                if args.operation in ("validate", "benchmark"):
+                    scans = None
+                selection = goes.discover(**request, satellite=args.satellite, bands=args.bands, scans_per_hour=scans)
         if args.max_files:
             assets = selection.assets[:args.max_files]
             ids = {a.id for a in assets}

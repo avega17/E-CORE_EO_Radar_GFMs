@@ -65,6 +65,15 @@ silently expand the scientific content of an existing store.
 identities to shared stored paths; keep these small records with the experiment.
 The original hash-only layout remains available with `--layout legacy`.
 
+## Store format
+
+New fetches write Zarr **format 3** stores (the same Blosc zstd-3 codec and
+bounded chunks as before, so content stays comparable). The earlier archive
+written with format 2 is preserved read-only at `/mnt/p/ecore_eo_datasets_zarrV2`;
+`open_raw` and the dataset viewer read both formats, and no existing subset is
+rewritten or migrated. The completion marker records the store format so the
+archive stays self-describing.
+
 Existing local date/hash folders are indexed once per fetch. Matching completed
 subsets are verified and moved into shared paths without downloading NOAA again.
 To merge an entire existing selection, including verified duplicates, run:

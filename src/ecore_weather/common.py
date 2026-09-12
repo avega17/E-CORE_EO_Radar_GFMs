@@ -92,6 +92,7 @@ class Selection:
     hourly_matches: tuple[dict, ...] = ()
     time_tolerance_minutes: float = 0
     time_match: str = "exact"
+    scans_per_hour: int | None = None  # GOES decimation; None keeps every scan
 
     @property
     def id(self):
@@ -106,7 +107,8 @@ class Selection:
             "files": len(self.assets), "source_MB": sum(a.size for a in self.assets) / 1e6,
             "missing_times": [t for t in self.expected_times if t not in observed],
             "bbox_west_south_east_north": self.bbox, "bands": self.bands,
-            "satellite": self.satellite, "expected_hourly_slots": len(self.expected_times),
+            "satellite": self.satellite, "scans_per_hour": self.scans_per_hour,
+            "expected_hourly_slots": len(self.expected_times),
             "availability_note": "See acquisition_coverage for satellite scan counts." if self.source == "goes"
                                  else "Missing times refer to requested hourly slots, separately from pixel coverage.",
             "time_match": self.time_match, "time_tolerance_minutes": self.time_tolerance_minutes,

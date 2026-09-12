@@ -71,6 +71,12 @@ The product control offers full-disk imagery only: the CONUS sector (roughly
 20°N–50°N, 125°W–65°W) does not cover Puerto Rico, and this project works in the
 Caribbean. CONUS products remain available from the command line for advanced use.
 
+**Scans/hour** controls how many images are kept from each UTC hour. The
+default, 1, keeps the scan nearest the top of the hour and downloads far less
+than the full inventory; raise it for denser sampling, keeping the scans nearest
+to evenly spaced marks. Validation and the long-run scripts request every
+available scan explicitly, so their measurements are unaffected.
+
 The ordinary reader selects bands and a geographic window before loading array
 chunks. Raw packed pixels and decoded physical values are different views; decoding
 uses the preserved calibration. Quality masking and interpolation are optional.
@@ -105,15 +111,27 @@ Ordinary fetched research data are never deleted by test cleanup. See the
 ## Dataset viewer (03)
 
 Run the setup cells, enter an archive prefix or individual `raw.zarr` /
-`raw.zarr.zip` path, and click **Find subsets**. Select an observation and variable,
-then **Show map**. A listing shows at most 200 subsets; use a product/date folder
-for a large archive. A fetch report JSON is also accepted. Local and
+`raw.zarr.zip` path, and click **Find**. For a local archive a **Month** list
+quickly shows which months have stored observations for the selected source
+before you search (folder names only, computed once per source); picking one
+sets Start and End to that month, and editing a date clears it. A progress bar
+and the status line show the search is running, then report observations, days
+covered, datasets, and elapsed time. The across-days view selects 1–24 images
+per day. The search
+is cached for the session, so repeating an identical search is instant. A period
+split across subset folders appears as one dataset entry. Select a dataset; for
+GOES the **Band** is then chosen from a row of buttons that lists only the bands
+actually stored, and switching bands re-reads the same observations without a
+new search. A listing shows at most 200 subsets; use a product/date folder for a
+large archive. A fetch report JSON is also accepted. Local and
 `hf://buckets/namespace/bucket/prefix` locations use the same controls.
 
 Display quality masking and **Hide zero values** change only the figure. Zero
 rain is valid. Packed GOES values are decoded in memory and plotted at their
-native geographic coordinates; this is not a persisted reprojection. **Save PNG**
-exports the figure. From a terminal:
+native geographic coordinates; this is not a persisted reprojection. After
+**Show map** or preparing a **Day**/**Multi-day** animation, an export row
+appears: the single image saves a PNG, and animations save a self-contained
+`.html`, a `.gif`, or an `.mp4` (`.mp4` needs an ffmpeg binary). From a terminal:
 
 ```bash
 python notebooks/03_view_datasets.py /path/to/raw.zarr.zip --hide-zero --output figures/rain.png

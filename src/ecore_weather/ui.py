@@ -108,7 +108,9 @@ def selection_controls(source):
         controls["satellite"] = widgets.Dropdown(options=[("GOES-East for dates", "auto")]+[(f"GOES-{s}",s) for s in (16,17,18,19)], value="auto", description="GOES")
         controls["bands"] = widgets.SelectMultiple(options=[(f"C{b:02d}", b) for b in range(1, 17)],
                                                    value=(8, 13), description="Bands", rows=5)
-        rows += [widgets.HBox([controls["satellite"], controls["bands"]])]
+        controls["scans_per_hour"] = widgets.BoundedIntText(value=1, min=1, max=6, description="Scans/hour",
+            tooltip="Scans to keep per UTC hour, nearest to evenly spaced marks. 1 keeps the scan nearest the top of the hour, which downloads far less than the full inventory. The long-run and validation scripts request every scan explicitly.")
+        rows += [widgets.HBox([controls["satellite"], controls["bands"]]), controls["scans_per_hour"]]
     else:
         controls["tolerance_minutes"] = widgets.BoundedFloatText(value=5, min=0, max=29, description="Margin (min)")
         controls["time_match"] = widgets.Dropdown(options=[("Latest at/before slot", "previous"), ("Nearest, either side", "nearest"), ("Exact clock hour", "exact")], description="Hour match")
@@ -139,7 +141,8 @@ def read_controls(controls):
                "bbox": tuple(controls[name].value for name in ("west", "south", "east", "north")),
                "product": controls["product"].value}
     if "satellite" in controls:
-        request.update(satellite=controls["satellite"].value, bands=controls["bands"].value)
+        request.update(satellite=controls["satellite"].value, bands=controls["bands"].value,
+                       scans_per_hour=controls["scans_per_hour"].value)
     else:
         request.update(tolerance_minutes=controls["tolerance_minutes"].value, time_match=controls["time_match"].value)
     return request

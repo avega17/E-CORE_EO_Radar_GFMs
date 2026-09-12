@@ -8,7 +8,7 @@
 # the dates to explore the new 2023 fetches as they complete.
 #
 # Three tabs show a single image, every available observation within one day,
-# or 4–8 selected images per day across the period. Maps support dragging and
+# or 1–24 selected images per day across the period. Maps support dragging and
 # scrolling to zoom. Animations prepare images once, then use Play or the frame
 # slider. Missing observations are not filled or interpolated in time.
 #
@@ -66,10 +66,25 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # Credentials stay in your environment. HF ZIP subsets use temporary local
 # scratch while opening; preparation closes those files after each frame.
 #
-# Change a search parameter and click **Find observations** again. Choose one
-# dataset and satellite band. **Hide zero values** makes valid zero rain
-# transparent in the display. **Save a PNG too** exports a static map from the
-# single-image tab. Preparing an animation shows its own progress bar.
+# For a local archive, the **Month** list quickly shows which months have stored
+# observations for the selected source before you search (computed once, only for
+# that source), so you can avoid a period with none. Picking a month sets Start
+# and End to that month; editing a date clears the selection, so choose a manual
+# range to span more than one month. Click **Find**; a small bar and the status
+# line show the search is running, then report how many observations, days, and
+# datasets matched and how long it took. One period that happens to be split
+# across subset folders appears as a single dataset entry.
+# The satellite **Band** is chosen after the search, as a row of buttons next to
+# the view controls. Only the bands actually stored in the selected dataset are
+# shown, and switching bands re-reads the same observations without a new search.
+# **Hide zero values** makes valid zero rain transparent in the display.
+# Preparing an animation shows its own progress bar.
+#
+# After you **Show map** or prepare a **Day**/**Multi-day** animation, an export
+# row appears below the tabs. Enter a path and click **Export**: the single image
+# saves a PNG, and animations save a self-contained `.html` page, a `.gif`, or an
+# `.mp4` (the `.mp4` option needs an ffmpeg binary). Colors keep the same fixed
+# scale as the on-screen view.
 
 # %%
 if __name__ != "__mp_main__":
@@ -86,3 +101,6 @@ if __name__ != "__mp_main__":
 # and [Copernicus xarray example](https://help.marine.copernicus.eu/en/articles/8077952-how-to-open-and-visualize-zarr-format-data)
 # describe larger-scale visualization options. A tile service is later work if
 # our small subset viewer becomes insufficient.
+
+# %% [markdown]
+#

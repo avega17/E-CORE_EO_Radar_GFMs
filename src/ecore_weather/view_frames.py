@@ -63,7 +63,7 @@ def png(frame, scale):
     return 'data:image/png;base64,'+base64.b64encode(stream.getvalue()).decode()
 
 
-def prepare(records, variable=None, quality=True, hide_zero=False, pixels=384, progress=None, max_frames=300):
+def prepare(records, variable=None, quality=True, hide_zero=False, pixels=384, progress=None, max_frames=1500):
     if not records:raise ValueError('No observations match this view.')
     if len(records)>max_frames:raise ValueError(f'{len(records)} frames exceed the {max_frames}-frame display limit. Shorten the period or reduce images per day.')
     frames=[]
@@ -104,10 +104,23 @@ def leaflet(frames):
     return panel
 
 
+def ffmpeg_available():
+    import shutil
+    return shutil.which('ffmpeg') is not None
+
+
+ANIMATION_FORMATS = ('html', 'gif', 'mp4')
+
+
 def save_animation(frames, path, interval=500):
-    """Self-contained Matplotlib HTML playback for headless runs; no tile service."""
+    """Export prepared frames; the writer is chosen from the file extension.
+
+    .html writes a self-contained jshtml page (no tile service), .gif uses the
+    Pillow writer, and .mp4 uses ffmpeg when a binary is available. Colors use
+    the same fixed scale as the interactive view.
+    """
     import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation
+    from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
     scale=limits(frames)
     fig,ax=plt.subplots(figsize=(7,6),constrained_layout=True)
     artist=ax.imshow(frames[0]['values'],extent=frames[0]['extent'],vmin=scale[0],vmax=scale[1],cmap='viridis')
@@ -116,8 +129,17 @@ def save_animation(frames, path, interval=500):
     def update(i):artist.set_data(frames[i]['values']);ax.set_title(frames[i]['time']);return [artist]
     animation=FuncAnimation(fig,update,frames=len(frames),interval=interval,blit=False)
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    suffix=path.suffix.lower().lstrip('.')
     try:
         import matplotlib as mpl
-        with mpl.rc_context({'animation.embed_limit':100}):path.write_text(animation.to_jshtml())
+        if suffix in ('html','htm'):
+            with mpl.rc_context({'animation.embed_limit':100}):path.write_text(animation.to_jshtml())
+        elif suffix=='gif':
+            animation.save(path,writer=PillowWriter(fps=max(1,round(1000/interval))))
+        elif suffix=='mp4':
+            if not ffmpeg_available():raise RuntimeError('ffmpeg is not installed; choose .html or .gif.')
+            animation.save(path,writer=FFMpegWriter(fps=max(1,round(1000/interval))))
+        else:
+            raise ValueError('Choose a .html, .gif, or .mp4 export path.')
     finally:plt.close(fig)
     return str(path)

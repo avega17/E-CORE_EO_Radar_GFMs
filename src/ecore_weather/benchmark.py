@@ -59,6 +59,58 @@ def raster_summary(path):
                 "array_sha256": hashlib.sha256(canonical.tobytes()).hexdigest()}
 
 
+def goes_throughput(selection, report_dir, variants, repeats=2):
+    """Measure GOES fetch throughput across backend, block size and workers.
+
+    Each variant writes to an isolated temporary local destination that is
+    deleted after timing. The first variant's per-asset fingerprints are the
+    reference; every later variant must match them, so speed differences never
+    come from changed content. Timing is sensitive to caches and network
+    conditions; repeat promising variants before drawing conclusions.
+
+    variants: iterable of dicts with backend, block_size and workers keys.
+    Returns a DataFrame with one row per (variant, repeat).
+    """
+    from . import storage
+    report_dir = Path(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    reference = None
+    rows = []
+    for variant in variants:
+        backend, block_size, workers = variant["backend"], int(variant["block_size"]), int(variant["workers"])
+        for attempt in range(int(repeats)):
+            with tempfile.TemporaryDirectory(prefix="ecore-throughput-") as temp:
+                before = time.perf_counter()
+                report = storage.fetch(selection, destination=temp, workers=workers, backend=backend,
+                                       read_processes=workers, report_dir=None, container="zip",
+                                       block_size=block_size)
+                wall = time.perf_counter() - before
+                saved = [r for r in report["records"] if r["status"] in ("saved", "reused")]
+                failed = [r for r in report["records"] if r["status"] == "failed"]
+                fps = {}
+                for r in saved:
+                    with storage.open_raw(r["url"]) as ds:
+                        fps[r["asset_id"]] = storage.fingerprint(ds)
+                if reference is None:
+                    reference = fps
+                equal = fps == reference
+                row = {"backend": backend, "block_size": block_size, "workers": workers,
+                       "repeat": attempt, "wall_s": wall, "files": len(saved), "failed": len(failed),
+                       "read_s": sum(r.get("read_decode_crop_s", 0) for r in saved),
+                       "write_s": sum(r.get("write_s", 0) for r in saved),
+                       "publish_s": sum(r.get("publish_s", 0) for r in saved),
+                       "bytes": report.get("read_bytes"), "requests": report.get("requests"),
+                       "fingerprints_equal": equal}
+                row["effective_MBps"] = (report.get("read_bytes", 0) / 1e6 / wall) if wall else None
+                rows.append(row)
+                print(row, flush=True)
+    table = pd.DataFrame(rows)
+    write_json(report_dir / "goes-throughput.json", {"variants": [dict(v) for v in variants],
+                                                      "repeats": repeats, "rows": rows,
+                                                      "files": len(selection.assets)})
+    return table
+
+
 def run_mrms(selection, report_dir="artifacts/benchmarks", repeats=1, variants=None, workers=None, read_processes=0):
     """Run the original and revised readers in separate fresh Python processes.
 

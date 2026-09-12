@@ -34,11 +34,41 @@ def scan_time(text):
         tzinfo=timezone.utc, microsecond=int(text[13:].ljust(6, "0") or 0))
 
 
-def discover(start, end, bbox=PR_BBOX, bands=(8, 13), satellite="auto", product="ABI-L2-MCMIPF"):
+def hourly_scans(assets, count):
+    """Keep at most count scans per UTC hour, nearest to evenly spaced marks.
+
+    count=1 selects the scan nearest the top of the hour; count=2 the scans
+    nearest :00 and :30, and so on. No scan is reused for two marks, and ties
+    break toward the earlier time then key, so the result is deterministic.
+    CMIP products apply the rule per band: each band keeps its own count scans.
+    """
+    if count < 1:
+        raise ValueError("scans_per_hour must be at least 1 (0 requests all scans).")
+    groups = {}
+    for asset in assets:
+        band_match = re.search(r"-M\dC(\d\d)_", asset.key)
+        band = int(band_match[1]) if band_match else None
+        groups.setdefault((utc(asset.time).replace(minute=0, second=0, microsecond=0), band), []).append(asset)
+    picked = []
+    for (hour, _), candidates in groups.items():
+        marks = [hour + timedelta(minutes=60 * i / count) for i in range(count)]
+        remaining = sorted(candidates, key=lambda a: (a.time, a.key))
+        for mark in marks:
+            if not remaining:
+                break
+            best = min(remaining, key=lambda a: (abs((utc(a.time) - mark).total_seconds()), utc(a.time), a.key))
+            picked.append(best)
+            remaining.remove(best)
+    return sorted(picked, key=lambda a: (a.time, a.key))
+
+
+def discover(start, end, bbox=PR_BBOX, bands=(8, 13), satellite="auto", product="ABI-L2-MCMIPF", scans_per_hour=1):
     start, end, bbox = validate_request(start, end, bbox)
     satellite = east_satellite(start, end) if satellite == "auto" else int(satellite)
     if product not in PRODUCTS:
         raise ValueError(f"Supported CMI products: {', '.join(PRODUCTS)}")
+    if scans_per_hour is not None and not 1 <= int(scans_per_hour) <= 6:
+        raise ValueError("Choose 1-6 scans per hour, or 0/None for every available scan.")
     bands = tuple(sorted(set(map(int, bands))))
     if not bands or any(b < 1 or b > 16 for b in bands):
         raise ValueError("Select one or more ABI bands from 1 to 16.")
@@ -69,12 +99,17 @@ def discover(start, end, bbox=PR_BBOX, bands=(8, 13), satellite="auto", product=
                     asset = Asset(bucket, key, obj["Size"], obj["ETag"].strip('"'), iso(when), iso(until))
                     if identity not in candidates or key > candidates[identity].key:
                         candidates[identity] = asset
-    return Selection("goes", product, iso(start), iso(end), bbox,
-                     sorted(candidates.values(), key=lambda a: (a.time, a.key)), bands=bands, satellite=satellite)
-
-
+    assets = sorted(candidates.values(), key=lambda a: (a.time, a.key))
+    if scans_per_hour is not None:
+        assets = hourly_scans(assets, int(scans_per_hour))
+    return Selection("goes", product, iso(start), iso(end), bbox, assets,
+                     bands=bands, satellite=satellite, scans_per_hour=scans_per_hour)
 def acquisition_coverage(selection):
-    """Expected versus observed slots for the supported full-disk/CONUS modes."""
+    """Expected versus observed slots for the supported full-disk/CONUS modes.
+
+    A decimated selection (scans_per_hour set) counts only its own scans, so the
+    hourly totals are not a statement about archive completeness.
+    """
     from collections import defaultdict
     by_hour = defaultdict(list)
     for asset in selection.assets:
@@ -150,10 +185,10 @@ def subset_dataset(ds, bbox, bands):
     return ds[selected_variables(ds, bands)].isel(window).load()
 
 
-def read(asset, bbox=PR_BBOX, bands=(8, 13), transport=None, full_file=False):
+def read(asset, bbox=PR_BBOX, bands=(8, 13), transport=None, full_file=False, block_size=1024 * 1024):
     if transport is None:
         with Transport() as owned:
-            return read(asset, bbox, bands, owned, full_file)
+            return read(asset, bbox, bands, owned, full_file, block_size)
     before = time.perf_counter()
     if full_file:
         with tempfile.TemporaryDirectory(prefix="ecore-goes-") as temp:
@@ -164,7 +199,7 @@ def read(asset, bbox=PR_BBOX, bands=(8, 13), transport=None, full_file=False):
             with xr.open_dataset(path, engine="h5netcdf", decode_cf=False, mask_and_scale=False) as ds:
                 subset = subset_dataset(ds, bbox, bands)
     else:
-        with remote_file(asset, transport) as source:
+        with remote_file(asset, transport, block_size=block_size) as source:
             with xr.open_dataset(source, engine="h5netcdf", decode_cf=False, mask_and_scale=False) as ds:
                 subset = subset_dataset(ds, bbox, bands)
     elapsed = time.perf_counter() - before

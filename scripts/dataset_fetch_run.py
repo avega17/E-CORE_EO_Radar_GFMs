@@ -16,6 +16,7 @@ def main():
     p.add_argument('--product', help='MRMS or GOES product, when discovering a new selection')
     p.add_argument('--bands', nargs='+', type=int, help='GOES bands; default C08-C11/C13-C16')
     p.add_argument('--satellite', type=int, default=16)
+    p.add_argument('--scans-per-hour', type=int, default=0, metavar='N', help='GOES scans to keep per hour (1-6); 0 keeps every available scan')
     p.add_argument('--source', choices=['mrms','goes','both'], default='both')
     p.add_argument('--destination', required=True, help='Explicit local cache or mounted archive directory')
     p.add_argument('--scratch', default='/tmp/ecore-long-scratch')
@@ -37,15 +38,33 @@ def main():
             selection=catalog.load_selection(args.selection or saved)
             if selection.source!=source:raise ValueError('Selection source does not match --source.')
             if args.product and selection.product!=args.product:raise ValueError('Selection product differs from --product.')
-            if args.bands and tuple(sorted(args.bands))!=selection.bands:raise ValueError('Selection bands differ from --bands.')
+            if args.bands and tuple(sorted(args.bands))!=selection.bands:
+                if args.selection or source=='mrms':
+                    raise ValueError('Selection bands differ from --bands.')
+                # Band expansion on a reused output folder: a multiband (MCMIP)
+                # subset's identity includes its bands, so the new band set is a
+                # new subset folder. Re-discover so matching files still resume and
+                # only the new subsets are fetched; the saved selection is replaced.
+                selection=goes.discover(args.start,args.end,satellite=selection.satellite or args.satellite,
+                                        product=selection.product,bands=tuple(sorted(args.bands)),
+                                        scans_per_hour=selection.scans_per_hour)
+                catalog.save_selection(selection,directory)
             if args.selection:catalog.save_selection(selection,directory)
             if selection.start[:10]!=args.start or selection.end[:10]!=args.end:
                 raise ValueError('Output folder contains a different date selection; choose another output folder.')
         else:
-            # Long samples keep every available observation; scans_per_hour=None is explicit.
-            selection=(mrms.discover(args.start,args.end,product=args.product or mrms.DEFAULT_PRODUCT) if source=='mrms' else
-                       goes.discover(args.start,args.end,satellite=args.satellite,product=args.product or 'ABI-L2-MCMIPF',
-                                     bands=tuple(args.bands or (8,9,10,11,13,14,15,16)),scans_per_hour=None))
+            # Long samples default to every available observation (scans_per_hour=0 -> None).
+            bands=tuple(args.bands or (8,9,10,11,13,14,15,16))
+            if args.product:
+                product=args.product
+            elif source=='goes':
+                product=storage.infer_goes_product(args.destination,args.satellite,bands)
+                print(f'No --product given; inferred {product} from existing subsets.',flush=True)
+            else:
+                product=mrms.DEFAULT_PRODUCT
+            selection=(mrms.discover(args.start,args.end,product=product) if source=='mrms' else
+                       goes.discover(args.start,args.end,satellite=args.satellite,product=product,
+                                     bands=bands,scans_per_hour=args.scans_per_hour or None))
             catalog.save_selection(selection,directory)
         discovery_s=time.perf_counter()-before
         write_json(out/f'{source}-progress.json',dict(stage='fetch',selection=selection.summary()))

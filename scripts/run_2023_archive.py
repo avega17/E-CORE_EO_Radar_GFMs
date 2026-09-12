@@ -27,7 +27,7 @@ def main():
         state['jobs'].append(job)
         for attempt in range(1,args.attempts+1):
             state['active_source']=source;state['active_attempt']=attempt;write_json(out/'status.json',state)
-            command=[sys.executable,'scripts/fetch_long_sample.py','--source',source,'--start','2023-01-01','--end',end,
+            command=[sys.executable,'scripts/dataset_fetch_run.py','--source',source,'--start','2023-01-01','--end',end,
                      '--selection',f'results/comparison-2023/{source}/selection/collection.json',
                      '--destination',args.destination,'--output',str(out),'--container','zip',
                      '--workers',str(args.workers),'--read-processes',str(args.read_processes)]

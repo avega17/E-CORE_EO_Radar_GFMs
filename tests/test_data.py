@@ -540,3 +540,111 @@ def test_interrupt_cancels_queued_fetches_and_records_progress(tmp_path, monkeyp
     assert len(report['records'])==len(calls)
     assert not list((tmp_path/'scratch').iterdir())
     assert all(r['status']=='saved' for r in report['records'])
+
+
+def _scan(key_time, minute, band=None):
+    band_key = f"-M6C{band:02d}" if band else "-M6"
+    key = f"ABI-L2-MCMIPF/2022/250/00/OR_ABI-L2-MCMIPF{band_key}_G16_s202225000{minute:02d}00_e202225000{minute:02d}59_c202225000{minute:02d}99.nc"
+    return Asset("noaa-goes16", key, 10, "e", key_time)
+
+
+def test_hourly_scans_picks_nearest_to_marks_without_reuse():
+    from ecore_weather.goes import hourly_scans
+    # Scans at :02, :11, :28, :41, :50, :58 within one hour (multiband keys).
+    minutes = [2, 11, 28, 41, 50, 58]
+    assets = [_scan(f"2022-09-07T00:{m:02d}:00Z", m) for m in minutes]
+    one = hourly_scans(assets, 1)
+    assert [a.time for a in one] == ["2022-09-07T00:02:00Z"]  # nearest to :00
+    two = hourly_scans(assets, 2)
+    assert [a.time for a in two] == ["2022-09-07T00:02:00Z", "2022-09-07T00:28:00Z"]  # nearest to :00 and :30
+    six = hourly_scans(assets, 6)
+    assert [a.time for a in six] == [f"2022-09-07T00:{m:02d}:00Z" for m in [2, 11, 28, 41, 50, 58]]
+    # More marks than available scans: keep all, no reuse.
+    sparse = [_scan("2022-09-07T00:05:00Z", 5), _scan("2022-09-07T00:40:00Z", 40)]
+    assert len(hourly_scans(sparse, 6)) == 2
+
+
+def test_hourly_scans_applies_per_band_for_single_band_products():
+    from ecore_weather.goes import hourly_scans
+    assets = ([_scan(f"2022-09-07T00:{m:02d}:00Z", m, band=8) for m in (2, 28)] +
+              [_scan(f"2022-09-07T00:{m:02d}:00Z", m, band=13) for m in (2, 28)])
+    assert len(hourly_scans(assets, 1)) == 2  # one per band
+
+
+def test_selection_scans_per_hour_roundtrip(tmp_path):
+    bbox = (-70.24, 14.36, -62.56, 22.04)
+    asset = _scan("2022-09-07T00:02:00Z", 2)
+    selection = Selection("goes", "ABI-L2-MCMIPF", "2022-09-07", "2022-09-08", bbox, [asset],
+                          bands=(8, 13), satellite=16, scans_per_hour=3)
+    save_selection(selection, tmp_path)
+    loaded = load_selection(tmp_path / "collection.json")
+    assert loaded.scans_per_hour == 3
+    assert loaded.summary()["scans_per_hour"] == 3
+    # Earlier manifests without the field still load with the None default.
+    legacy = Selection("goes", "ABI-L2-MCMIPF", "2022-09-07", "2022-09-08", bbox, [asset],
+                       bands=(8, 13), satellite=16)
+    assert legacy.scans_per_hour is None
+
+
+def test_cli_scans_per_hour_default_and_all():
+    from ecore_weather.cli import parser
+    goes_parser = parser("goes")
+    args = goes_parser.parse_args([])
+    assert args.scans_per_hour == 1
+    assert goes_parser.parse_args(["--scans-per-hour", "0"]).scans_per_hour == 0
+    controls = __import__("ecore_weather.ui", fromlist=["ui"]).selection_controls("goes")
+    assert controls["scans_per_hour"].value == 1
+    assert controls["scans_per_hour"].min == 1 and controls["scans_per_hour"].max == 6
+
+
+def _synthetic_frame(time="2022-09-07T00:00:00Z"):
+    import numpy as np
+    values = np.linspace(0, 60, 16, dtype="float32").reshape(4, 4)
+    return {"values": values, "bbox": (-70, 14, -62, 22), "extent": (0, 1, 0, 1),
+            "time": time, "label": "CMI C13", "units": "K", "path": "x"}
+
+
+def test_save_animation_html_and_gif_and_bad_extension(tmp_path):
+    from ecore_weather.view_frames import save_animation
+    frames = [_synthetic_frame(), _synthetic_frame("2022-09-07T00:10:00Z")]
+    html = save_animation(frames, tmp_path / "a.html")
+    assert (tmp_path / "a.html").read_text() and html.endswith(".html")
+    gif = save_animation(frames, tmp_path / "a.gif")
+    assert (tmp_path / "a.gif").stat().st_size > 0 and gif.endswith(".gif")
+    with pytest.raises(ValueError):
+        save_animation(frames, tmp_path / "a.txt")
+
+
+def test_save_animation_mp4_requires_ffmpeg(tmp_path, monkeypatch):
+    from ecore_weather import view_frames
+    monkeypatch.setattr(view_frames, "ffmpeg_available", lambda: False)
+    with pytest.raises(RuntimeError):
+        view_frames.save_animation([_synthetic_frame()], tmp_path / "a.mp4")
+
+
+def _goes_subset(path, bands=(8, 13)):
+    import numpy as np
+    from ecore_weather.storage import write_raw
+    coords = {"x": np.linspace(-0.01, 0.01, 4), "y": np.linspace(-0.01, 0.01, 4)}
+    ds = xr.Dataset(coords=coords)
+    for b in bands:
+        ds[f"CMI_C{b:02d}"] = (("y", "x"), np.full((4, 4), 100 + b, "int16"), {"scale_factor": 0.1, "add_offset": 200.0, "units": "K", "_FillValue": np.int16(-1)})
+        ds[f"DQF_C{b:02d}"] = (("y", "x"), np.zeros((4, 4), "int8"))
+    ds["goes_imager_projection"] = ((), 0, {"grid_mapping_name": "geostationary", "semi_major_axis": 6378137.0, "semi_minor_axis": 6356752.31414,
+        "perspective_point_height": 35786023.0, "longitude_of_projection_origin": -75.0, "latitude_of_projection_origin": 0.0,
+        "sweep_angle_axis": "x"})
+    ds.attrs["observation_time"] = "2022-09-07T00:00:00Z"
+    ds.attrs["requested_bbox"] = [-66.6, 17.9, -66.2, 18.3]
+    write_raw(ds, path)
+
+
+def test_viewer_main_band_decoupled_on_multiband(tmp_path):
+    from ecore_weather.viewer import main
+    marker_dir = tmp_path / "goes" / "ABI-L2-MCMIPF" / "roi-x" / "2022" / "09" / "07" / "000000-scan"
+    marker_dir.mkdir(parents=True)
+    _goes_subset(marker_dir / "raw.zarr")
+    (marker_dir / "complete.json").write_text('{"raw_path":"raw.zarr","asset_id":"scan"}')
+    out = tmp_path / "view.png"
+    # Band 13 is a display variable, not a search filter, on a multiband store.
+    assert main([str(tmp_path), "--source", "goes", "--band", "13", "--output", str(out)]) == 0
+    assert out.exists()

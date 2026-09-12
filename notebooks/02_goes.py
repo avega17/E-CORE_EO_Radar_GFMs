@@ -36,8 +36,6 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
     REVISION = os.getenv("ECORE_REVISION", "main")
     IN_COLAB = "google.colab" in sys.modules or bool(os.getenv("COLAB_RELEASE_TAG"))
     if IN_COLAB:
-        from google.colab import output
-        output.enable_custom_widget_manager()
         root = Path("/content/E-CORE_EO_Radar_GFMs")
         if not root.exists():
             subprocess.run(["git", "clone", REPOSITORY, str(root)], check=True)
@@ -88,6 +86,13 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # remain available from the command line for advanced use. A collapsed "Product
 # and variable guide" below the controls describes both full-disk products and
 # all sixteen ABI bands.
+#
+# **Scans/hour** controls how many images are kept from each UTC hour. The
+# default, 1, keeps the scan nearest the top of the hour and downloads far less
+# than the full inventory (full disk has up to six scans an hour). Raise it for
+# denser sampling; the scans nearest to evenly spaced marks are kept. The
+# validation runs and the long-run scripts request every available scan
+# explicitly, so their measurements are unaffected by this control.
 
 # %%
 if __name__ != "__mp_main__":  # Spawned readers must not construct notebook widgets.
@@ -120,12 +125,11 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # %%
 if __name__ != "__mp_main__":  # Spawned readers must not construct notebook widgets.
     def fetch_data():
-        with ui.FetchProgress(len(chosen["value"].assets)) as progress:
-            report = storage.fetch(chosen["value"], destination=controls["destination"].value,
-                                   workers=controls["workers"].value, report_dir=controls["output"].value,
-                                   layout=controls["layout"].value, container=controls["container"].value, read_processes=controls["read_processes"].value,
-                                   scratch=controls["scratch"].value or None, progress=progress,
-                                   inspect=lambda ds: diagnostics.describe(ds).to_dict("records"))
+        report = storage.fetch(chosen["value"], destination=controls["destination"].value,
+                               workers=controls["workers"].value, report_dir=controls["output"].value,
+                               layout=controls["layout"].value, container=controls["container"].value, read_processes=controls["read_processes"].value,
+                               scratch=controls["scratch"].value or None,
+                               inspect=lambda ds: diagnostics.describe(ds).to_dict("records"))
         successful = [r for r in report["records"] if r["status"] in ("saved", "reused")]
         controls["image_index"].max = max(0, len(successful)-1)
         display(dict(Counter(r["status"] for r in report["records"])))

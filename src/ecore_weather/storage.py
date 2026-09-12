@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from contextlib import nullcontext, contextmanager
 import multiprocessing
@@ -71,8 +72,9 @@ def fingerprint(ds):
 
 
 def write_raw(ds, path):
-    from numcodecs import Blosc, blosc
-    blosc.set_nthreads(1)
+    # Zarr format 3 stores; the Blosc codec and chunk rule are unchanged from the
+    # earlier format 2 stores, so content bytes and fingerprints stay comparable.
+    from zarr.codecs import BloscCodec, BloscShuffle
     stored = ds.copy(deep=False)
     stored.attrs = jsonable(ds.attrs)
     encoding = {}
@@ -80,13 +82,19 @@ def write_raw(ds, path):
         stored[name].attrs = jsonable(ds[name].attrs)
         stored[name].encoding = {}
         var = stored[name]
-        encoding[name] = {"compressor": Blosc(cname="zstd", clevel=3, shuffle=Blosc.SHUFFLE)}
+        encoding[name] = {"compressors": BloscCodec(cname="zstd", clevel=3, shuffle=BloscShuffle.shuffle)}
         if var.ndim:
             encoding[name]["chunks"] = tuple(min(256, size) for size in var.shape)
         # Do not introduce float NaN fill codes into a raw source array.
         if "_FillValue" not in var.attrs:
             encoding[name]["_FillValue"] = None
-    stored.to_zarr(str(path), mode="w", zarr_format=2, consolidated=True, encoding=encoding)
+    # Consolidated metadata is deliberate (small stores, fast open); zarr-python 3
+    # warns per store that it is not yet in the format 3 spec, which is noise on a
+    # long run. Silence only that specific warning around the intentional write.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Consolidated metadata is currently not part",
+                                category=UserWarning, module=r"zarr.*")
+        stored.to_zarr(str(path), mode="w", zarr_format=3, consolidated=True, encoding=encoding)
     with open_raw(path) as reopened:
         if fingerprint(reopened) != fingerprint(stored):
             raise ValueError("The saved raw arrays differ from the source subset.")
@@ -118,7 +126,10 @@ def open_raw(path):
     else:
         mapper = str(path)
     try:
-        ds = xr.open_zarr(mapper, consolidated=True, decode_cf=False, mask_and_scale=False, chunks=None)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Consolidated metadata is currently not part",
+                                    category=UserWarning, module=r"zarr.*")
+            ds = xr.open_zarr(mapper, consolidated=True, decode_cf=False, mask_and_scale=False, chunks=None)
     except Exception:
         if archive: archive.close()
         if temporary: temporary.cleanup()
@@ -187,12 +198,12 @@ def _publish(staging, root, marker):
         write_json(target / "complete.json", marker)
 
 
-def _process_read(asset, source, bbox, product, bands, backend):
+def _process_read(asset, source, bbox, product, bands, backend, block_size=1024 * 1024):
     """Independent HDF5 reader, avoiding h5py's process-wide thread lock."""
     from . import mrms, goes
     with Transport(backend) as transport:
         ds, timings = (mrms.read(asset, bbox, product, transport) if source == "mrms"
-                       else goes.read(asset, bbox, bands, transport))
+                       else goes.read(asset, bbox, bands, transport, block_size=block_size))
         return ds, timings, transport.bytes, transport.requests
 
 
@@ -210,6 +221,39 @@ def subset_identity(selection):
 
 def product_path(selection):
     return f"{selection.source}/{selection.product}" + (f"/goes{selection.satellite}" if selection.satellite else "")
+
+
+def infer_goes_product(destination, satellite, bands, products=("ABI-L2-MCMIPF", "ABI-L2-CMIPF")):
+    """Choose MCMIPF for a fresh period, CMIPF when bands are already stored.
+
+    The multiband MCMIPF store fetches every requested band in one file, so it
+    suits a new period. The single-band CMIPF store reuses band subsets already
+    present, so it suits adding bands over time. We look for any requested band
+    already completed under either product (band is in the CMIP source name) and
+    prefer CMIPF only when one is found; otherwise MCMIPF. Explicit --product
+    always wins; this only fills in a missing choice.
+    """
+    import re
+    base = Path(destination) / "goes"
+    wanted = set(map(int, bands)) if bands else set()
+    found = set()
+    for product in products:
+        root = base / product / f"goes{satellite}"
+        if not root.is_dir():
+            continue
+        for marker in root.rglob("complete.json"):
+            try:
+                url = json.loads(marker.read_text()).get("source_url", "")
+            except (OSError, json.JSONDecodeError):
+                continue
+            match = re.search(r"-M\dC(\d{2})_", url)
+            if match:
+                found.add(int(match[1]))
+            else:
+                # A multiband subset: any requested band counts as present.
+                found |= wanted
+    present = (wanted & found) if wanted else found
+    return "ABI-L2-CMIPF" if present else "ABI-L2-MCMIPF"
 
 
 @contextmanager
@@ -273,7 +317,7 @@ def _adopt_local(candidates, out, selection, asset, subset_id):
 
 def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", scratch=None,
           report_dir="artifacts/runs", progress=None, decode_workers=1, validate_only=False, inspect=None,
-          layout="readable", read_processes=0, container="directory"):
+          layout="readable", read_processes=0, container="directory", block_size=1024 * 1024):
     """Fetch one small store per source file, with bounded memory and simple resume.
 
     The returned rows include array locations, timings, and failures. A rerun
@@ -358,14 +402,14 @@ def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", 
                     raise OSError("Not enough free scratch space for this source file.")
                 if read_pool is not None:
                     ds, timings, read_bytes, calls = read_pool.submit(_process_read, asset, selection.source,
-                        selection.bbox, selection.product, selection.bands, backend).result()
+                        selection.bbox, selection.product, selection.bands, backend, block_size).result()
                     with transport._lock:
                         transport.bytes += read_bytes
                         transport.requests += calls
                 elif selection.source == "mrms":
                     ds, timings = mrms.read(asset, selection.bbox, selection.product, transport)
                 else:
-                    ds, timings = goes.read(asset, selection.bbox, selection.bands, transport)
+                    ds, timings = goes.read(asset, selection.bbox, selection.bands, transport, block_size=block_size)
                 with ds:
                     before = time.perf_counter()
                     write_raw(ds, staging / "raw.zarr")
