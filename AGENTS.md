@@ -1,98 +1,144 @@
 # Project development guidelines
 
-This NSF-funded project develops reproducible NOAA radar and satellite data pipelines for near-term rain and storm forecasting, initially for Puerto Rico. Follow the development plan in `docs/development_plan.md` and the supplied sources in `docs/agent_dev_references`.
+This NSF-funded project prepares reproducible NOAA radar and satellite datasets
+for near-term rain and storm forecasting, initially for Puerto Rico. Read
+[`docs/development_plan.md`](docs/development_plan.md) and the supplied references
+in `docs/agent_dev_references.md` before extending the pipeline. Keep technical
+explanations direct and readable; introduce terms when they first matter.
 
 ## Scientific data preservation
 
-- Persist requested raw raster subsets as-is in scientific content. Storage/container changes and lossless compression are allowed; ingestion must not clean, interpolate, reproject, normalize, clip, impute, quantize, or temporally aggregate the measurements.
-- Preserve native coordinates, resolution, values, units, timestamps, quality flags, missing-value encodings, and relevant product metadata. For packed GOES variables, preserve packed values and their scale/offset and fill metadata. For GRIB, preserve decoded numeric values and explicit bitmap missingness; do not claim original GRIB bytes are retained.
-- Keep one canonical persisted representation of a subset. Do not retain duplicate legacy GRIB, gzip, NetCDF, or GeoTIFF files. Source files needed for decoding are temporary scratch, cleaned after success or failure. Preserve URLs, object identity, checksums, and metadata for provenance instead.
-- Virtual references may point directly to NOAA's original objects, never to temporary downloads that will be deleted. Reference artifacts remain dependent on remote source availability.
-- Keep diagnostics and derived preprocessing separate from raw ingestion. Never overwrite raw data with masks or cleaned values. Persist derived rasters only when explicitly requested; small diagnostic tables, plots, and provenance are ordinary outputs.
-- Interpret sentinels by product, metadata, and source version. Do not mask all negative values: negative radar reflectivity can be valid. Distinguish no coverage, missing pixels, missing observations/files, valid zero, and unknown anomalies.
-- Preserve accumulation intervals and physical units. Hourly QPE accumulation is not instantaneous rain rate. Do not infer historical operational availability from S3 LastModified, which may reflect backfill.
-- Do not fill missing observations with zeros or allow future observations into model input windows. Report coverage and eligibility explicitly.
+- Persist requested raw raster subsets unchanged in scientific content. Storage
+  and lossless compression may change; ingestion must not clean, interpolate,
+  reproject, normalize, impute, quantize, or aggregate measurements.
+- Preserve native coordinates, resolution, values, units, timestamps, quality
+  flags, missing-value encodings, and product metadata. GOES packed values must
+  retain their scale, offset, and fill metadata. MRMS GRIB values are decoded
+  numbers with explicit bitmap missingness; do not claim the original GRIB bytes
+  are retained.
+- Keep one canonical persisted archive for each source/product/region-grid/band
+  and month. Temporary NOAA source objects and per-observation staging stores are
+  removed after the monthly archive passes read-back verification..
+- Keep diagnostics and derived processing separate from raw storage. Interpolate,
+  mask, decode, and reproject in the session unless a separate output is explicitly
+  requested. Never overwrite the raw archive.
+- Interpret sentinels by product, metadata, and source version. Do not mask all
+  negative values: negative reflectivity can be valid. Separate valid zero,
+  no-coverage values, bitmap gaps, absent files, and unknown anomalies.
+- Preserve accumulation intervals and physical units. Hourly QPE is an
+  accumulation even if selected at ten-minute intervals. Do not use S3
+  `LastModified` as historical operational availability.
+- Do not fill missing observations with zeros or include future observations in
+  model windows. Report coverage and eligibility explicitly.
 
-## Repository and notebooks
+## Sources and temporal selection
 
-- Put reusable code in an installable package under `src/ecore_weather/`, organized by responsibility. Keep notebooks focused on explanation, selection controls, figures, and small calls into the package.
-- Author user-facing notebooks as valid Python percent-format scripts in `notebooks/`, using `# %%` and `# %% [markdown]`. Pair them with `.ipynb` using Jupytext; treat `.py` as the source of truth.
-- Commit synchronized notebook pairs without credentials, large embedded data, or bulky execution outputs. Check script compilation and notebook synchronization for notebook changes.
-- Maintain README links and Colab launch links for every user-facing notebook, updating descriptions when interfaces change.
-- Notebook widgets and headless Python/CLI execution must use the same request and pipeline interfaces. Widget construction must not launch downloads or uploads.
-- In Colab, clone the repository at a configurable revision, install the package, and report the resolved commit. Testing modified `src/` code through cloning requires that exact revision to be pushed first. Do not report Colab validation against a different revision as validation of local changes.
-- Use `AGENTS.md` as the shared instruction source. Harness-specific instruction files should point to it rather than maintain competing copies.
+- Use original AWS CARIB MRMS products for Puerto Rico.
+- Use custom Earth2Studio-compatible sources in `src/ecore_weather/earth2_sources.py`
+  when the stock source does not provide the needed region, product, or raw
+  metadata. Keep shared reads in the project MRMS and GOES modules.
+- MRMS study defaults: precipitation rate, composite reflectivity, and
+  low-level azimuthal shear sampled on ten-minute UTC slots, plus multisensor
+  Pass2 QPE at hourly cadence. Other supported products remain selectable. Use the
+  exact CARIB S3 azimuthal-shear keys with underscores and 00.50 suffixes.
+  Match the newest source
+  observation at/before each slot within five minutes, do not reuse an observation,
+  and record actual times/offsets and missing slots.
+- GOES defaults: full-disk scans as available, per-band CMIPF, and StormScope
+  example bands C01/C02/C03/C07/C08/C09/C10/C13. Keep each native band grid and
+  calibration epoch separate. MCMIPF is an option, not a reason to merge
+  incompatible arrays.
+- Earth2Studio compatibility does not establish compatibility with a released
+  StormScope checkpoint. Training, fine-tuning, inference, and scheduler-specific
+  workflows remain outside current scope.
 
-## Environments
+## Storage and index
 
-- Use Conda for local and future cluster development, with `environment.yml` as the environment specification. Prefer conda-forge for compiled geospatial/scientific dependencies and declare pip-only dependencies explicitly.
-- Include Jupytext, notebook tooling, and the dependencies actually used. Keep dependency management reproducible; avoid an independently maintained `requirements.txt` as a competing environment definition.
-- Colab may use a tested, version-matched pip bootstrap because it supplies its own notebook runtime. Keep this compatibility mapping aligned with the Conda environment.
-- Keep optional GPU/model dependencies isolated from the CPU data pipeline. Do not assume Argonne resources use the same accelerator or CUDA stack as the local machine.
+- Use anonymous NOAA reads. Keep credentials out of URLs, logs, notebooks, STAC,
+  manifests, and committed files.
+- Default durable storage to the configured HF bucket and permit explicit local
+  storage. `HF_BUCKET_NAME=namespace/bucket` is preferred;
+  `HF_DATASET_REPO` is a documented compatibility alias. `HF_TOKEN` is for Hub
+  APIs, not an S3 access key. The S3 gateway's key and secret are distinct.
+- Use the namespace endpoint, bare bucket name, path-style S3 addressing,
+  `us-east-1`, and checksums only when required. Verify the gateway with a small
+  write/reopen/read-back test before relying on it. One coordinator publishes
+  remote monthly archives; after repeated errors, fail clearly and require an
+  explicit local destination. Never silently redirect output.
+- Use Earth2Studio's standard `ZarrBackend` for the default local monthly
+  archive path. Keep arrays named and coordinate-aware so a project
+  `DataSource` can reopen them through Earth2Studio's `(time, variable)` API.
+  Preserve non-dimension source provenance in a compact sidecar. The direct-HF
+  monthly writer uses Earth2Studio's `AsyncZarrBackend` through obstore, with
+  bounded time sharding, remote read-back, and a completion marker only after
+  verification. Study backups use one ZIP per MRMS product/year under
+  `noaa-subsets/yearly-v1/`; each packages verified local monthly archives
+  without merging their arrays. Publish four independent product/year bundles
+  in parallel, read each object back and check its SHA-256, then remove only
+  matching superseded monthly prefixes. Never let concurrent workers write the
+  same store or shard, and never silently change writer implementations after a
+  failure.
+- Start with two local monthly writers for separate stores. Bound source download
+  concurrency and decoding independently. Direct HF monthly writes use one
+  writer; the year-bundle backup uses four independent product/year transfers.
+  Report HF transfer measurements after a run; do not forecast HF throughput
+  precisely.
+- Keep `results/archive_index.duckdb` on a local Linux disk. One process owns
+  writes. It is a rebuildable convenience index; STAC selections and monthly
+  completion manifests remain the portable source of truth.
+- Optimize from measured transfer bytes, requests, elapsed time, decoding cost,
+  memory, and final size. Zarr, STAC, range reads, and concurrency are not automatic
+  guaranteed speedups.
 
-## Catalogs, storage, and performance
+## Package, notebooks, and environment
 
-- Discover and persist selections before fetching data. Use STAC Collections and Items for interoperable metadata, with a linked executable selection manifest and run status records.
-- Use anonymous access for NOAA AWS. Keep credentials out of URLs, logs, notebooks, STAC, and committed files.
-- Default durable storage to the configured Hugging Face bucket. Support an explicit local destination and bounded local scratch with available-space checks. Never silently change durable destinations following an authentication/upload failure.
-- The existing `HF_DATASET_REPO` setting currently names the project bucket. Migrate to `HF_BUCKET_NAME` with a documented compatibility alias; do not infer that it names a dataset repository.
-- Use the HF token for Hub bucket APIs. Hugging Face S3 gateway credentials are distinct credentials; never treat an HF token as an AWS access key.
-- Publish completed, validated partitions with provenance; support retries and resume without marking partial uploads complete. Do not delete unrelated existing local or remote assets.
-- Optimize based on measured bytes, requests, wall time, decode cost, memory, and storage. Do not promise that STAC, Zarr, virtualization, or more workers automatically reduces source transfer.
-- Bound I/O concurrency separately from CPU decoding. Use isolated temporary directories, manage file handles, avoid nested worker oversubscription, and coordinate shared writes.
-- Preserve source encoding/calibration epochs when combining GOES files. Verify compatible grids, dtypes, codecs, scale/offset values, and quality-flag schemas.
+- Put reusable functions under `src/ecore_weather/`; keep notebooks focused on
+  explanation, dynamic selection controls, visuals, and small calls into modules.
+- Author notebook sources as Python percent-format files under `notebooks/` with
+  `# %%` and `# %% [markdown]`. Keep `.ipynb` partners synchronized using
+  Jupytext. Commit clean notebooks without credentials, large embedded data, or
+  execution outputs.
+- Notebook widgets and CLI scripts must use the same request and pipeline
+  functions. Widget construction must not fetch data. Both fetchers support
+  argparse, progress output, inline visualizations, and optional PNG exports.
+- Keep notebook 03 available for local and HF archives, with source selection,
+  date/time filtering, one-sample map view, and bounded daily/multi-day sequences.
+  HF annual ZIPs are backup containers: restore a selected, verified monthly
+  member into a local cache before viewing it. The storage explorer compares
+  compressed archive bytes with listed NOAA source-object bytes from metadata.
+  Viewer masks must not alter archived arrays. Prioritize the new monthly
+  Earth2Studio schema; legacy single-observation support is optional.
+- In Colab, detect the runtime, clone a configurable revision, install notebook
+  dependencies, and show the resolved commit. Push modified `src/` code before
+  validating it through a clone. Do not report another revision as local-code
+  validation.
+- Use Conda and `environment.yml`; prefer conda-forge for compiled geospatial
+  dependencies. Declare pip-only dependencies explicitly. Keep optional GPU/model
+  dependencies out of the CPU data environment.
+- Update README links, `docs/notebooks.md`, `docs/developer_guide.md`,
+  `docs/storage.md`, `docs/status.md`, and this file when interfaces or evidence
+  change. Use plain-language explanations.
 
-## Current scope and evidence
+## Validation and operations
 
-- First deliver historical Puerto Rico research batch pipelines. Live ingestion services, training, fine-tuning, and NVIDIA model execution are outside the current implementation scope.
-- Use original AWS MRMS CARIB data for Puerto Rico. Dynamical's cited MRMS CONUS collection does not cover Puerto Rico.
-- Materialize lossless cropped MRMS Zarr where gzip prevents useful range virtualization. Support GOES range reads and optional virtual artifacts referencing AWS.
-- Earthmover GOES-16 access is an optional authenticated comparison. It must not block the AWS-based workflow or be assumed to cover GOES-19.
-- The released StormScope workflow has CONUS grid and substantial GPU requirements. Puerto Rico preparation must produce an honest compatibility report, not assert direct checkpoint readiness or forecast skill.
-- Consult the supplied references, verify source metadata and current primary documentation, and distinguish verified findings from hypotheses. Record access limitations and relevant version changes.
-
-
-## First notebook implementation priorities
-
-- Retain the completed weekly pilot evidence (September 18–25, 2022 and September
-  15–22, 2024). Current notebook examples and expanded tests use the periods below.
-- Validate the unchanged mentor calculations before optimizing. Compare identical
-  source files, report off-hour files separately, and repeat promising timing
-  comparisons three times. Keep HF publishing separate from download timings.
-- Write explanations in plain language. Keep Colab to runtime detection, cloning,
-  and dependency installation; automated launch links and CI are later work.
-- Use one small Zarr store per source object initially. More elaborate partitioning,
-  production services, external mirrors, Icechunk, and model inference are deferred.
-- Keep the mentor scripts unchanged. Their grid and missing-value behavior are
-  reference behavior to measure, not rules for preserving scientific raw data.
-
-
-## Expanded validation and documentation
-
-- Current test periods are September 1–December 1 in 2022 and 2025 (UTC, end excluded): full hourly MRMS and full GOES discovery with representative scan reads.
-- Default hourly MRMS matching is at or before the slot within five minutes. Preserve actual source timestamps and offsets; nearest either side is explicit opt-in.
-- Maintain `docs/notebooks.md`, `docs/developer_guide.md`, `docs/validation.md`, and `docs/status.md` as functionality and evidence change.
-- Both notebook sources must support argparse execution and dynamic widgets through shared functions. Default download workers to `max(1, multiprocessing.cpu_count() // 2)` and bound decoding separately.
-- Provide inline imagery and optional PNG export in both interfaces. Keep processing in memory.
-- Keep selections to a Collection plus ItemCollection and virtual references to one bundle. Validation uses temporary data and retains a compact result; delete successful test artifacts after recording evidence. Never delete unrelated or ordinary durable research data.
-
-
-## H2 2022 archive and HF publication
-
-- Current long sample is July 1, 2022–January 1, 2023: all available hourly MRMS and GOES-16 scans with C08–C11/C13–C16. This channel selection does not establish checkpoint compatibility.
-- Stage locally and archive to `/mnt/p/ecore_eo_datasets`; verify Windows P: is actually mounted with `findmnt`. Do not mistake an ordinary WSL directory for the DAS.
-- Keep HF publication separate from download concurrency. Use direct batch APIs and one publishing coordinator; completion follows raw read-back verification. Workstation POSIX locks are not distributed cluster locks.
-- Support readable source/product/date paths and directory or ZIP Zarr, retaining one canonical raw container. Never copy Linux permission attributes onto DrvFS as a scientific metadata requirement.
-- Maintain `docs/storage.md`, `docs/mentor_code_review.md`, and `docs/long_sample.md` alongside the existing guides and evidence.
-
-
-## Shared archives and viewing
-
-- Readable storage paths must not depend on the requested time window. Use source
-  identity plus native pixel/band selection; keep request slots in run metadata.
-- Verify earlier local stores before moving or removing duplicate raw containers.
-  Keep relocation evidence and never delete unrelated archive files.
-- Maintain the third local/HF dataset viewer notebook alongside the two fetchers.
-  Geographic context and display masks must leave saved raw arrays unchanged.
-- Final long comparison uses H1 2023 available hourly MRMS and January 2023 GOES-16
-  CMIPF discovery with representative bands 1,2,3,7,8,9,10,13 scan comparisons.
+- Cover the completed weekly pilots, the September–November 2022/2025 selection
+  checks, and the larger requested representative periods only as described in
+  current validation/status docs. Full MRMS slot checks and representative GOES
+  scan reads have different cost and coverage.
+- Check raw source-to-Zarr value, coordinate, calibration, quality, sentinel, and
+  bitmap preservation; repeated and interrupted runs; monthly merge/reuse;
+  the Earth2Studio monthly-source contract; index search/rebuild; and HF
+  read-back. Legacy archive migration is outside the storage acceptance gate.
+- Delete only successful test artifacts created for that test after retaining
+  compact evidence. Do not delete durable research data or unrelated bucket files.
+  Keep detailed file explosions and executed notebook outputs out of Git.
+- Verify `/mnt/p` is the mounted Windows P: drive before a long local archive
+  fetch. Keep scratch on a fast Linux disk when practical; ensure enough free
+  space. Avoid imposing Linux permission metadata on DrvFS.
+- Record which checks passed and which were blocked by the runtime or network.
+  Do not claim live HF, Earth2Studio, Colab, or long-run validation without a
+  completed test on the exact current code.
+- The two study job commands and their checkpoints are in `docs/study_jobs.md`.
+  The GOES job inventories metadata and reads only bounded crop samples; the
+  MRMS job writes to P: after a mount and Earth2Studio preflight. Treat exit 75
+  as a resumable month-boundary pause, not completion of the study period.

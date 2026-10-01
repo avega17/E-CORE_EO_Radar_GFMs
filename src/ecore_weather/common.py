@@ -56,6 +56,19 @@ def hours(start, end):
         current += timedelta(hours=1)
 
 
+def time_slots(start, end, cadence_minutes):
+    """Yield UTC slots on a cadence-aligned clock, with the end excluded."""
+    if cadence_minutes < 1 or 60 % cadence_minutes:
+        raise ValueError("Cadence must be a positive divisor of 60 minutes.")
+    current = utc(start).replace(second=0, microsecond=0)
+    minute = (current.minute // cadence_minutes) * cadence_minutes
+    current = current.replace(minute=minute)
+    while current < utc(end):
+        if current >= utc(start):
+            yield current
+        current += timedelta(minutes=cadence_minutes)
+
+
 def digest(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:20]
 
@@ -93,6 +106,7 @@ class Selection:
     time_tolerance_minutes: float = 0
     time_match: str = "exact"
     scans_per_hour: int | None = None  # GOES decimation; None keeps every scan
+    cadence_minutes: int | None = None  # requested slots; actual source timestamps remain in assets
 
     @property
     def id(self):
@@ -108,6 +122,7 @@ class Selection:
             "missing_times": [t for t in self.expected_times if t not in observed],
             "bbox_west_south_east_north": self.bbox, "bands": self.bands,
             "satellite": self.satellite, "scans_per_hour": self.scans_per_hour,
+            "cadence_minutes": self.cadence_minutes,
             "expected_hourly_slots": len(self.expected_times),
             "availability_note": "See acquisition_coverage for satellite scan counts." if self.source == "goes"
                                  else "Missing times refer to requested hourly slots, separately from pixel coverage.",

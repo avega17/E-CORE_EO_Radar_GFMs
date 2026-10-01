@@ -18,12 +18,13 @@ from pyproj import CRS, Transformer
 from .common import (Asset, PR_BBOX, Selection, Transport, digest, hours, iso,
                      jsonable, list_objects, remote_file, s3_client, utc, validate_request, write_json)
 
-PRODUCTS = ("ABI-L2-MCMIPF", "ABI-L2-MCMIPC", "ABI-L2-CMIPF", "ABI-L2-CMIPC")
+PRODUCTS = ("ABI-L2-CMIPF", "ABI-L2-CMIPC", "ABI-L2-MCMIPF", "ABI-L2-MCMIPC")
+STORMSCOPE_BANDS = (1, 2, 3, 7, 8, 9, 10, 13)
 
 
 def east_satellite(start, end):
-    # NOAA operational notice: MSG_20250407_1510.html.
-    transition = utc("2025-04-07T15:10:00Z")
+    # NOAA OSPO reports GOES-19 became operational East at 15:00 UTC.
+    transition = utc("2025-04-07T15:00:00Z")
     if utc(start) < transition < utc(end):
         raise ValueError("Split a GOES-East request at the GOES-16/19 transition, or choose a satellite explicitly.")
     return 19 if utc(start) >= transition else 16
@@ -62,7 +63,7 @@ def hourly_scans(assets, count):
     return sorted(picked, key=lambda a: (a.time, a.key))
 
 
-def discover(start, end, bbox=PR_BBOX, bands=(8, 13), satellite="auto", product="ABI-L2-MCMIPF", scans_per_hour=1):
+def discover(start, end, bbox=PR_BBOX, bands=STORMSCOPE_BANDS, satellite="auto", product="ABI-L2-CMIPF", scans_per_hour=None):
     start, end, bbox = validate_request(start, end, bbox)
     satellite = east_satellite(start, end) if satellite == "auto" else int(satellite)
     if product not in PRODUCTS:
@@ -139,7 +140,19 @@ def _physical_coordinate(var):
 
 
 def projection(ds):
-    attrs = ds["goes_imager_projection"].attrs
+    if "goes_imager_projection" in ds:
+        attrs = ds["goes_imager_projection"].attrs
+    elif "source_metadata_json" in ds.coords:
+        # Monthly native-band archives keep per-scan scalar metadata in a
+        # sidecar so calibration epochs cannot be silently merged. A selected
+        # observation has one scalar JSON record to recover its projection.
+        value = np.asarray(ds.source_metadata_json.values)
+        if value.size != 1:
+            raise ValueError("Select one GOES observation before using its projection")
+        metadata = json.loads(str(value.item()))
+        attrs = metadata["variables"]["goes_imager_projection"]["attrs"]
+    else:
+        raise KeyError("GOES projection metadata is unavailable")
     return CRS.from_cf(attrs), float(attrs["perspective_point_height"])
 
 

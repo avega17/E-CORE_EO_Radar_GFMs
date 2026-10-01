@@ -8,6 +8,7 @@ dependencies:
   - pandas>=2.2,<3
   - xarray==2026.7.0
   - dask
+  - duckdb>=1.4,<2
   - eccodes
   - cfgrib
   - rasterio
@@ -33,9 +34,11 @@ dependencies:
   - pytest
   - psutil
   - python-dotenv
+  - loguru
   - pip:
       - obstore==0.11.1
       - virtualizarr==2.7.3
       - kerchunk==0.2.10
       - huggingface_hub==1.30.0
+      - earth2studio==0.18.0
       - -e .

@@ -13,6 +13,8 @@ _MRMS_ROWS = [
     ("PrecipRate_00.00", "Instantaneous radar precipitation rate, not an hourly total", "mm h−1", "−1 / −3", "~2 minutes"),
     ("MergedReflectivityQCComposite_00.50", "Quality-controlled composite (column-maximum) reflectivity", "dBZ", "−99 / −999", "~2 minutes"),
     ("MergedBaseReflectivityQC_00.50", "Quality-controlled lowest-tilt (base) reflectivity", "dBZ", "−99 / −999", "~2 minutes"),
+    ("MergedAzShear_0-2kmAGL_00.50", "Low-level azimuthal shear, a radar rotation proxy", "0.001 s−1", "0 / 0; check bitmap", "~2 minutes"),
+    ("MergedAzShear_3-6kmAGL_00.50", "Mid-level azimuthal shear, a radar rotation proxy", "0.001 s−1", "0 / 0; check bitmap", "~2 minutes"),
 ]
 _MRMS_NOTE = ("An hourly accumulation is millimetres over the whole hour, not an instantaneous rate. "
               "−1 marks missing data and −3 marks no radar coverage; zero is a valid rain-free measurement, "
@@ -80,18 +82,27 @@ def selection_controls(source):
         "start": widgets.DatePicker(value=date.fromisoformat(start), description="Start (UTC)"),
         "end": widgets.DatePicker(value=date.fromisoformat(end), description="End, excluded"),
         "destination": widgets.Text(value="hf", description="Save to", placeholder="hf or a local directory"),
-        "workers": widgets.IntText(value=default_workers(), description="Tasks", tooltip="Maximum simultaneous file tasks: download, decode and save. Hugging Face publication stays coordinated separately."),
-        "read_processes": widgets.IntText(value=0, description="Readers", tooltip="Separate Python processes for downloading and decoding. 0 uses threads; positive values bypass HDF5 thread locking. Capped by Tasks; more readers use more RAM."),
-        "container": widgets.Dropdown(options=[("Zarr directory", "directory"), ("Zarr ZIP (fewer files)", "zip")], description="Container"),
-        "layout": widgets.Dropdown(options=[("Readable paths", "readable"), ("Earlier hash-only paths", "legacy")], description="Layout"),
+        "workers": widgets.IntText(value=default_workers(), description="Source reads", tooltip="Concurrent NOAA source-file reads per monthly archive (maximum 16). This controls network I/O threads, not monthly writers. It does not increase Hugging Face writer concurrency; HF publication stays at one writer. Decode concurrency is limited separately."),
+        "read_processes": widgets.IntText(value=0, description="Readers", tooltip="Optional separate Python processes for reading source files. 0 uses threads; separate processes can use more memory."),
+        "monthly_writers": widgets.BoundedIntText(value=2, min=1, max=8, description="Monthly writers",
+            tooltip="Number of separate local monthly Zarr archives to build at once. HF publishing stays at one writer to limit gateway requests."),
         "scratch": widgets.Text(value="", description="Local scratch", placeholder="Optional fast staging folder"),
         "save_figures": widgets.Checkbox(value=False, description="Save displayed figures"),
         "figure_dir": widgets.Text(value="figures", description="Figure folder"),
         "output": widgets.Text(value=f"results/{source}", description="Run folder"),
         "image_index": widgets.IntSlider(value=0, min=0, max=0, description="Image index"),
         # Widgets offer full-disk GOES only; CONUS products stay available through the CLI.
-        "product": widgets.Dropdown(options=list(mrms.PRODUCTS) if source == "mrms" else [p for p in goes.PRODUCTS if not p.endswith("C")],
-                                     description="Product", layout=widgets.Layout(width="600px")),
+        "product": (widgets.SelectMultiple(options=[
+                        ("Precipitation rate (~2 min; sample every 10 min)", "PrecipRate_00.00"),
+                        ("Composite reflectivity (~2 min; sample every 10 min)", "MergedReflectivityQCComposite_00.50"),
+                        ("Low-level azimuthal shear (~2 min; sample every 10 min)", "MergedAzShear_0-2kmAGL_00.50"),
+                        ("Multisensor Pass2 one-hour QPE (hourly)", mrms.DEFAULT_PRODUCT)],
+                        value=mrms.DEFAULT_PRODUCTS, description="Products", rows=4,
+                        tooltip="Default research set: precipitation rate, composite reflectivity, low-level shear, and hourly multisensor Pass2 QPE. Other products can be named with --product in script runs.",
+                        layout=widgets.Layout(width="600px")) if source == "mrms" else
+                    widgets.Dropdown(options=[("CMIPF, one file per band", "ABI-L2-CMIPF"),
+                        ("MCMIPF, all bands per scan", "ABI-L2-MCMIPF")],
+                        value="ABI-L2-CMIPF", description="Product", layout=widgets.Layout(width="600px"))),
     }
     for name, value in zip(("west", "south", "east", "north"), PR_BBOX):
         controls[name] = widgets.FloatText(value=value, description=name.title(), layout=widgets.Layout(width="210px"))
@@ -106,25 +117,33 @@ def selection_controls(source):
             widgets.HBox([controls["east"], controls["north"]]), controls["product"]]
     if source == "goes":
         controls["satellite"] = widgets.Dropdown(options=[("GOES-East for dates", "auto")]+[(f"GOES-{s}",s) for s in (16,17,18,19)], value="auto", description="GOES")
-        controls["bands"] = widgets.SelectMultiple(options=[(f"C{b:02d}", b) for b in range(1, 17)],
-                                                   value=(8, 13), description="Bands", rows=5)
-        controls["scans_per_hour"] = widgets.BoundedIntText(value=1, min=1, max=6, description="Scans/hour",
-            tooltip="Scans to keep per UTC hour, nearest to evenly spaced marks. 1 keeps the scan nearest the top of the hour, which downloads far less than the full inventory. The long-run and validation scripts request every scan explicitly.")
+        wavelengths = (0.47, 0.64, 0.86, 1.37, 1.6, 2.2, 3.9, 6.2,
+                       6.9, 7.3, 8.4, 9.6, 10.3, 11.2, 12.3, 13.3)
+        names = ("Blue visible", "Red visible", "Veggie near-IR", "Cirrus", "Snow/ice",
+                 "Cloud phase", "Shortwave IR", "Upper-level water vapor",
+                 "Mid-level water vapor", "Lower-level water vapor", "Cloud-top phase",
+                 "Ozone", "Clean longwave window", "Longwave window", "Dirty longwave window",
+                 "CO₂ longwave")
+        band_options = [(f"{names[b-1]} (C{b:02d}, {wavelengths[b-1]:g} µm)", b)
+                        for b in range(1, 17)]
+        controls["bands"] = widgets.SelectMultiple(options=band_options,
+            value=goes.STORMSCOPE_BANDS, description="ABI bands", rows=6,
+            tooltip="Choose native ABI channels. StormScope example defaults are C01, C02, C03, C07, C08, C09, C10, and C13.")
+        controls["scans_per_hour"] = widgets.Dropdown(options=[("All available (~10-minute scans)", 0)]+[(f"{n} per hour", n) for n in range(1, 7)],
+            value=0, description="Scan frequency", tooltip="Keep every available scan by default. Choose a smaller count only to make an exploratory selection shorter.")
         rows += [widgets.HBox([controls["satellite"], controls["bands"]]), controls["scans_per_hour"]]
     else:
-        controls["tolerance_minutes"] = widgets.BoundedFloatText(value=5, min=0, max=29, description="Margin (min)")
+        controls["tolerance_minutes"] = widgets.BoundedFloatText(value=5, min=0, max=5, description="Margin (min)")
         controls["time_match"] = widgets.Dropdown(options=[("Latest at/before slot", "previous"), ("Nearest, either side", "nearest"), ("Exact clock hour", "exact")], description="Hour match")
         rows += [controls["tolerance_minutes"], controls["time_match"]]
     controls["cheatsheet"] = product_cheatsheet(source)
     rows += [controls["cheatsheet"], controls["destination"], controls["workers"], controls["read_processes"],
-             controls["container"], controls["layout"], controls["scratch"], controls["output"]]
+             controls["monthly_writers"], controls["scratch"], controls["output"]]
     for name, control in controls.items():
         if hasattr(control, "tooltip") and not control.tooltip:
             control.tooltip = {"start": "First requested UTC date, included.", "end": "Stopping UTC date, excluded.",
                 "destination": "hf uses the configured bucket. Enter a local path to store locally.",
                 "scratch": "Temporary local source files and Zarr staging; cleaned after each task.",
-                "container": "Same lossless arrays: a directory or one ZIP file per source subset.",
-                "layout": "Readable paths reuse matching pixels across date requests. Legacy is for earlier hash-only runs.",
                 "output": "Small selections, diagnostics and timing reports; separate from raw data.",
                 "time_match": "Previous avoids selecting an observation from the future.",
                 "tolerance_minutes": "Maximum difference between the hourly slot and actual observation time."}.get(name, getattr(control, "description", "Product and variable guide"))
@@ -142,9 +161,11 @@ def read_controls(controls):
                "product": controls["product"].value}
     if "satellite" in controls:
         request.update(satellite=controls["satellite"].value, bands=controls["bands"].value,
-                       scans_per_hour=controls["scans_per_hour"].value)
+                       scans_per_hour=controls["scans_per_hour"].value or None)
     else:
-        request.update(tolerance_minutes=controls["tolerance_minutes"].value, time_match=controls["time_match"].value)
+        request.update(products=controls["product"].value,
+                       tolerance_minutes=controls["tolerance_minutes"].value,
+                       time_match=controls["time_match"].value)
     return request
 
 

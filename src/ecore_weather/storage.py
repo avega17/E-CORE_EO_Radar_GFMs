@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
 import warnings
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from contextlib import nullcontext, contextmanager
 import multiprocessing
@@ -20,6 +22,12 @@ import xarray as xr
 from .common import PeakMemory, Selection, Transport, jsonable, write_json, default_workers, digest
 
 RAW_SCHEMA_VERSION = 1
+
+
+def valid_raw_name(name):
+    """Accept canonical legacy names and verified versioned monthly stores."""
+    return name in {"raw.zarr", "raw.zarr.zip"} or bool(
+        re.fullmatch(r"raw-[0-9a-f]{32}\.zarr", str(name)))
 
 
 def metadata_fingerprint(ds):
@@ -71,6 +79,21 @@ def fingerprint(ds):
     return h.hexdigest()
 
 
+def fingerprint_streaming(ds):
+    """Equivalent to :func:`fingerprint`, reading time-dependent arrays in slices."""
+    h = hashlib.sha256()
+    for name in sorted(ds.variables):
+        var = ds[name]
+        h.update(name.encode())
+        h.update(str((var.dims, var.dtype.str, var.shape)).encode())
+        if "time" in var.dims and var.dims[0] == "time":
+            for index in range(var.shape[0]):
+                h.update(np.ascontiguousarray(var.isel(time=index).values).tobytes())
+        else:
+            h.update(np.ascontiguousarray(var.values).tobytes())
+    return h.hexdigest()
+
+
 def write_raw(ds, path):
     # Zarr format 3 stores; the Blosc codec and chunk rule are unchanged from the
     # earlier format 2 stores, so content bytes and fingerprints stay comparable.
@@ -105,31 +128,75 @@ def write_raw(ds, path):
 def open_raw(path):
     temporary = None
     archive = None
+    metadata = None
+    zip_path = None
     if str(path).endswith(".zip"):
         from zarr.storage import ZipStore
         if str(path).startswith("hf://"):
-            from .hf_storage import Publisher, bucket_writer
-            publisher = Publisher(str(path))
+            from .hf_storage import BucketWriter
+            bucket_root, name = str(path).rsplit("/", 1)
+            writer = BucketWriter(bucket_root)
             temporary = tempfile.TemporaryDirectory(prefix="ecore-raw-read-")
             try:
-                with bucket_writer(publisher.bucket):
-                    publisher._download([(publisher.prefix(str(path)), "raw.zarr.zip")], temporary.name)
-                archive = ZipStore(str(Path(temporary.name)/"raw.zarr.zip"), mode="r")
+                zip_path = Path(temporary.name) / name
+                writer.client.download_file(writer.config["bucket"], writer.key(name), str(zip_path))
+                archive = ZipStore(str(zip_path), mode="r")
             except Exception:
                 temporary.cleanup()
                 raise
         else:
+            zip_path = Path(path)
             archive = ZipStore(str(path), mode="r")
+        try:
+            import zipfile
+            with zipfile.ZipFile(zip_path, "r") as zipped:
+                metadata = json.loads(zipped.read("ecore_metadata.json"))
+        except (KeyError, OSError, zipfile.BadZipFile):
+            metadata = None
         mapper = archive
     elif str(path).startswith("hf://"):
-        mapper = _hf_fs().get_mapper(str(path).removeprefix("hf://"))
+        # Monthly remote Zarr uses the same path-style HF S3 gateway as the
+        # Earth2Studio writer. The Hub filesystem can list buckets but is not
+        # the reader for these native object-store arrays.
+        from .earth2_io import hf_store
+        from .hf_storage import BucketWriter
+        from zarr.storage import ObjectStore
+        writer = BucketWriter(str(path))
+        mapper = ObjectStore(hf_store(writer.bucket_id, writer.prefix), read_only=True)
+        try:
+            sidecar = writer.client.get_object(Bucket=writer.config["bucket"],
+                Key=writer.key("ecore_metadata.json"))
+            metadata = json.loads(sidecar["Body"].read())
+        except Exception as error:
+            code = getattr(error, "response", {}).get("Error", {}).get("Code")
+            if code not in {"NoSuchKey", "404", "NotFound"}:
+                raise
     else:
         mapper = str(path)
+        metadata_path = Path(path) / "ecore_metadata.json"
+        if metadata_path.is_file():
+            metadata = json.loads(metadata_path.read_text())
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Consolidated metadata is currently not part",
                                     category=UserWarning, module=r"zarr.*")
-            ds = xr.open_zarr(mapper, consolidated=True, decode_cf=False, mask_and_scale=False, chunks=None)
+            ds = xr.open_zarr(mapper, consolidated=None, decode_cf=False, mask_and_scale=False, chunks=None)
+        if metadata:
+            ds.attrs = metadata.get("dataset_attrs", ds.attrs)
+            for name, attrs in metadata.get("variable_attrs", {}).items():
+                if name in ds.variables:
+                    ds[name].attrs = attrs
+            for name, info in metadata.get("auxiliary_variables", {}).items():
+                values = np.asarray(info["values"], dtype=np.dtype(info["dtype"]))
+                ds[name] = (tuple(info["dims"]), values)
+                ds[name].attrs = metadata.get("variable_attrs", {}).get(name, {})
+            for name, attrs in metadata.get("coordinate_attrs", {}).items():
+                if name in ds.coords:
+                    ds[name].attrs = attrs
+            for name, info in metadata.get("auxiliary_coords", {}).items():
+                values = np.asarray(info["values"])
+                ds = ds.assign_coords({name: (tuple(info["dims"]), values)})
+                ds[name].attrs = info.get("attrs", {})
     except Exception:
         if archive: archive.close()
         if temporary: temporary.cleanup()
@@ -160,13 +227,8 @@ def pack_raw(staging):
 
 def _read_marker(root):
     if root.startswith("hf://"):
-        fs = _hf_fs()
-        key = root.removeprefix("hf://") + "/complete.json"
-        try:
-            with fs.open(key) as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return None
+        from .hf_storage import BucketWriter
+        return BucketWriter(root).marker()
     path = Path(root) / "complete.json"
     return json.loads(path.read_text()) if path.exists() else None
 
@@ -174,8 +236,8 @@ def _read_marker(root):
 def _publish(staging, root, marker):
     """Publish the arrays before the completion marker; never sync deletions."""
     if root.startswith("hf://"):
-        from .hf_storage import Publisher
-        Publisher(root).publish(staging, root, marker)
+        from .hf_storage import BucketWriter
+        BucketWriter(root).publish(staging, "", marker)
     else:
         target = Path(root)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -200,10 +262,10 @@ def _publish(staging, root, marker):
 
 def _process_read(asset, source, bbox, product, bands, backend, block_size=1024 * 1024):
     """Independent HDF5 reader, avoiding h5py's process-wide thread lock."""
-    from . import mrms, goes
+    from .earth2_sources import read_selected_asset
     with Transport(backend) as transport:
-        ds, timings = (mrms.read(asset, bbox, product, transport) if source == "mrms"
-                       else goes.read(asset, bbox, bands, transport, block_size=block_size))
+        ds, timings = read_selected_asset(asset, source, bbox, product, bands,
+                                          transport, block_size=block_size)
         return ds, timings, transport.bytes, transport.requests
 
 
@@ -317,7 +379,8 @@ def _adopt_local(candidates, out, selection, asset, subset_id):
 
 def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", scratch=None,
           report_dir="artifacts/runs", progress=None, decode_workers=1, validate_only=False, inspect=None,
-          layout="readable", read_processes=0, container="directory", block_size=1024 * 1024):
+          layout="readable", read_processes=0, container="directory", block_size=1024 * 1024,
+          index_results=True):
     """Fetch one small store per source file, with bounded memory and simple resume.
 
     The returned rows include array locations, timings, and failures. A rerun
@@ -348,17 +411,14 @@ def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", 
     if scratch:
         Path(scratch).mkdir(parents=True, exist_ok=True)
     if root.startswith("hf://"):
-        from .hf_storage import Publisher
-        publisher = Publisher(root)
+        from .hf_storage import BucketWriter
+        publisher = BucketWriter(root)
         publisher.check()
     if not validate_only:
         definition = {**subset_specification(selection), "subset_id": subset_id,
                       "note": "Shared native-pixel subsets; dates and hourly matching belong to selection/run records. CMIP band identity is in each source file."}
         if publisher:
-            from .hf_storage import bucket_writer
-            with bucket_writer(publisher.bucket):
-                publisher.api.batch_bucket_files(publisher.bucket, add=[(json.dumps(definition).encode(), publisher.prefix(root)+"/subset.json")])
-                publisher.batch_calls += 1
+            publisher.put_json("subset.json", definition)
         else:
             Path(root).mkdir(parents=True, exist_ok=True)
             # Atomic metadata replacement, including on the Windows-mounted archive.
@@ -374,12 +434,15 @@ def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", 
         stamp = asset.time[:19].replace("-", "").replace(":", "")
         relative = asset.id if layout == "legacy" else f"{stamp[:4]}/{stamp[4:6]}/{stamp[6:8]}/{stamp[9:]}-{asset.id}"
         out = root + "/" + relative
-        row = {"asset_id": asset.id, "time": asset.time, "url": out + "/" + raw_name, "source_url": asset.url, "relative_path": relative+"/"+raw_name}
+        row = {"asset_id": asset.id, "time": asset.time, "url": out + "/" + raw_name,
+               "source_url": asset.url, "relative_path": relative+"/"+raw_name,
+               "source_bytes": asset.size, "etag": asset.etag, "product": selection.product}
         if asset.id in matches:
             row.update(slot_time=matches[asset.id]["slot_time"], offset_seconds=matches[asset.id]["offset_seconds"])
         try:
             if publisher:
-                existing_path = publisher.resume(out, selection_id, asset.id, RAW_SCHEMA_VERSION, subset_id=subset_id if layout != "legacy" else None)
+                existing_path = publisher.resume(relative, asset.id, RAW_SCHEMA_VERSION,
+                                                 subset_id=subset_id if layout != "legacy" else None)
                 if existing_path:
                     return {**row, "url": out+"/"+existing_path, "relative_path": relative+"/"+existing_path, "status": "reused"}
             if not validate_only and not publisher and not Path(out).exists():
@@ -407,9 +470,14 @@ def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", 
                         transport.bytes += read_bytes
                         transport.requests += calls
                 elif selection.source == "mrms":
-                    ds, timings = mrms.read(asset, selection.bbox, selection.product, transport)
+                    from .earth2_sources import read_selected_asset
+                    ds, timings = read_selected_asset(asset, selection.source, selection.bbox,
+                                                       selection.product, selection.bands, transport)
                 else:
-                    ds, timings = goes.read(asset, selection.bbox, selection.bands, transport, block_size=block_size)
+                    from .earth2_sources import read_selected_asset
+                    ds, timings = read_selected_asset(asset, selection.source, selection.bbox,
+                                                       selection.product, selection.bands, transport,
+                                                       block_size=block_size)
                 with ds:
                     before = time.perf_counter()
                     write_raw(ds, staging / "raw.zarr")
@@ -420,7 +488,9 @@ def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", 
                     marker = {"asset_id": asset.id, "selection_id": selection_id, "subset_id": subset_id,
                               "array_sha256": fingerprint(ds), "source_url": asset.url,
                               "metadata_sha256": metadata_fingerprint(ds),
-                              "raw_schema_version": RAW_SCHEMA_VERSION, "source_etag": asset.etag, "raw_path": raw_name}
+                              "raw_schema_version": RAW_SCHEMA_VERSION, "source_etag": asset.etag,
+                              "raw_path": raw_name, "time": asset.time, "product": selection.product,
+                              "source_bytes": asset.size}
                     before = time.perf_counter()
                     if inspect is not None:
                         inspection = ds.copy(deep=False)
@@ -432,7 +502,7 @@ def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", 
                     before = time.perf_counter()
                     if not validate_only:
                         if publisher:
-                            publisher.publish(staging, out, marker)
+                            publisher.publish(staging, relative, marker)
                         else:
                             _publish(staging, out, marker)
                     row["publish_s"] = time.perf_counter() - before
@@ -470,6 +540,7 @@ def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", 
         rows = [future.result() for future in futures if not future.cancelled()]
     rows.sort(key=lambda r: (r["time"], r["asset_id"]))
     report = {"selection_id": selection_id, "source": selection.source, "root": root,
+              "started_at": datetime.now(timezone.utc).isoformat(),
               "interrupted": interrupted is not None, "not_started": len(selection.assets)-len(rows),
               "wall_s": time.perf_counter() - start, "read_bytes": transport.bytes,
               "data_read_calls": transport.requests, "peak_rss_bytes": memory.peak,
@@ -477,10 +548,20 @@ def fetch(selection: Selection, destination="hf", workers=None, backend="s3fs", 
               "read_processes": min(read_processes, workers),
               "selection_summary": selection.summary(), "records": rows, "layout": layout, "container": container,
               "effective_MB_s": transport.bytes / max(time.perf_counter()-start, 1e-9) / 1e6,
+              "source_read_seconds": transport.seconds,
+              "source_read_MB_s": transport.bytes / max(transport.seconds, 1e-9) / 1e6,
               "stored_bytes": sum(r.get("stored_bytes", 0) for r in rows),
               "logical_array_bytes": sum(r.get("logical_array_bytes", 0) for r in rows),
-              "hf_batch_calls": publisher.batch_calls if publisher else 0,
-              "hf_readback_bytes": publisher.readback_bytes if publisher else 0}
+              "hf_batch_calls": 0,
+              "hf_readback_bytes": publisher.readback_bytes if publisher else 0,
+              "hf_upload_bytes": publisher.upload_bytes if publisher else 0,
+              "hf_upload_seconds": publisher.upload_seconds if publisher else 0}
+    if index_results:
+        try:
+            from .index import record_fetch
+            record_fetch(report)
+        except ImportError:
+            pass
     if report_dir is not None:
         write_json(Path(report_dir) / f"{selection_id}-{backend}-{workers}.json", report)
     if interrupted is not None:

@@ -39,7 +39,15 @@ def save_selection(selection: Selection, directory):
     manifest = pystac.ItemCollection(items, extra_fields={"ecore:request": request})
     write_json(directory / "items.json", manifest.to_dict())
     write_json(directory / "collection.json", collection.to_dict())
-    return directory / "collection.json"
+    collection_path = directory / "collection.json"
+    try:
+        from .index import record_selection
+        record_selection(selection, collection_path)
+    except ImportError:
+        # Catalog creation remains usable in lightweight environments; install
+        # the project's declared DuckDB dependency to enable local indexing.
+        pass
+    return collection_path
 
 
 def _selection(request, assets):

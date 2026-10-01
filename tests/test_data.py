@@ -1,4 +1,6 @@
 from dataclasses import replace
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -6,8 +8,306 @@ import xarray as xr
 
 from ecore_weather import diagnostics, goes, mrms
 from ecore_weather.catalog import load_selection, save_selection
+from ecore_weather.cli import parser as cli_parser
 from ecore_weather.common import Asset, Selection, validate_request
-from ecore_weather.storage import fingerprint, open_raw, write_raw
+from ecore_weather.storage import fingerprint, open_raw, valid_raw_name, write_raw
+
+
+@pytest.mark.parametrize(("alias", "product"), mrms.PRODUCT_ALIASES.items())
+def test_mrms_cli_product_aliases(alias, product):
+    args = cli_parser("mrms").parse_args(["--product", alias])
+    assert args.product == [product]
+    assert cli_parser("mrms").parse_args(["--product", alias.upper()]).product == [product]
+
+
+def test_mrms_cli_keeps_exact_noaa_product_names():
+    for product in mrms.PRODUCTS:
+        assert mrms.parse_product_argument(product) == product
+
+
+def test_record_selection_hashes_large_selection_once(tmp_path):
+    from datetime import datetime, timezone
+    from ecore_weather import index
+
+    class CountedSelection:
+        source = "goes"
+        product = "ABI-L2-CMIPF"
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 2, 1, tzinfo=timezone.utc)
+        hourly_matches = ()
+
+        def __init__(self):
+            self.id_calls = 0
+            self.assets = [Asset("noaa-goes19", f"ABI-L2-CMIPF/C13/{i}.nc", 100,
+                f"etag-{i}", "2026-01-01T00:00:00Z") for i in range(3)]
+
+        @property
+        def id(self):
+            self.id_calls += 1
+            return "selection-id"
+
+        def summary(self):
+            return {"files": len(self.assets)}
+
+    selection = CountedSelection()
+    database = tmp_path / "archive-index.duckdb"
+    index.record_selection(selection, "selection.json", database)
+
+    assert selection.id_calls == 1
+    with index.connect(database) as db:
+        rows = db.execute("SELECT count(*), count(DISTINCT selection_id) FROM observations").fetchone()
+        assert rows == (3, 1)
+
+
+def test_mrms_study_records_empty_catalog_objects_but_does_not_fetch_them():
+    from scripts.fetch_mrms_study import partition_empty_sources
+
+    readable = Asset("noaa-mrms-pds", "CARIB/a.grib2.gz", 120, "abc",
+                     "2023-05-24T06:48:57Z")
+    empty = Asset("noaa-mrms-pds", "CARIB/empty.grib2.gz", 0,
+                  "d41d8cd98f00b204e9800998ecf8427e", "2023-05-24T06:58:57Z")
+    selection = Selection("mrms", mrms.DEFAULT_PRODUCT, "2023-05-24", "2023-05-25",
+                          (-70, 14, -62, 22), [readable, empty],
+                          expected_times=(readable.time, empty.time))
+
+    fetch_selection, invalid = partition_empty_sources(selection)
+
+    assert selection.assets == [readable, empty]
+    assert fetch_selection.assets == [readable]
+    assert fetch_selection.expected_times == selection.expected_times
+    assert invalid == [{"asset_id": empty.id, "bucket": empty.bucket, "key": empty.key,
+        "source_url": empty.url, "observation_time": empty.time, "size": 0,
+        "etag": empty.etag, "reason": "zero_byte_noaa_object"}]
+
+
+def test_mrms_retries_transient_incomplete_grib_read(monkeypatch):
+    import gzip
+    import threading
+
+    valid = bytearray(20)
+    valid[:4] = b"GRIB"
+    valid[8:16] = len(valid).to_bytes(8, "big")
+    invalid = bytearray(valid)
+    invalid[:4] = b"BAD!"
+    bad_bytes, good_bytes = gzip.compress(invalid), gzip.compress(valid)
+    assert len(bad_bytes) == len(good_bytes)
+    dataset = xr.Dataset({
+        "measurement": (("latitude", "longitude"), [[1.0]], {"units": "mm h-1"}),
+        "bitmap_valid": (("latitude", "longitude"), [[1]], {}),
+    }, coords={"latitude": [18.0], "longitude": [-66.0]})
+    monkeypatch.setattr(mrms, "decode_grib", lambda payload, product: dataset.copy(deep=True))
+
+    class FlakyTransport:
+        decode_slots = threading.BoundedSemaphore(1)
+
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, asset):
+            self.reads += 1
+            return bad_bytes if self.reads == 1 else good_bytes
+
+    asset = Asset("noaa-mrms-pds", "CARIB/PrecipRate_00.00/test.grib2.gz",
+                  len(good_bytes), "", "2023-05-01T00:00:00Z")
+    transport = FlakyTransport()
+    result, _ = mrms.read(asset, bbox=None, product="PrecipRate_00.00", transport=transport)
+    assert transport.reads == 2
+    np.testing.assert_array_equal(result.measurement.values, [[1.0]])
+
+
+def test_mrms_study_defaults_are_the_four_requested_fields():
+    assert mrms.DEFAULT_PRODUCTS == (
+        "PrecipRate_00.00",
+        "MergedReflectivityQCComposite_00.50",
+        "MergedAzShear_0-2kmAGL_00.50",
+        "MultiSensor_QPE_01H_Pass2_00.00",
+    )
+
+
+def test_yearly_mrms_bundle_keeps_month_zip_bytes_and_manifest(tmp_path):
+    import hashlib
+    import zipfile
+    from scripts.mirror_mrms_year_bundle import _build_bundle
+
+    product = mrms.DEFAULT_PRODUCTS[0]
+    archive = tmp_path / "local" / "mrms" / product / "2021" / "01" / "raw.zarr.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"already-compressed-month-archive")
+    marker_path = archive.parent / "complete.json"
+    marker = {"source": "mrms", "product": product, "raw_path": archive.name,
+        "observations": 1, "asset_ids": ["asset-1"],
+        "stored_bytes": archive.stat().st_size,
+        "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}
+    marker_path.write_text(json.dumps(marker))
+    entries = {archive.relative_to(tmp_path / "local").as_posix(): {
+        "archive": archive, "marker_path": marker_path, "marker": marker,
+        "member": "data/month.zip", "marker_member": "metadata/month/complete.json",
+        "selected_by": ["2021-01"]}}
+    bundle = _build_bundle(2021, product, entries, [], tmp_path / "out", tmp_path / "local")
+
+    with zipfile.ZipFile(bundle["path"]) as package:
+        assert package.read("data/month.zip") == archive.read_bytes()
+        assert json.loads(package.read("metadata/month/complete.json")) == marker
+        manifest = json.loads(package.read("year_manifest.json"))
+    assert manifest["archive_count"] == 1
+    assert manifest["archives"][0]["sha256"] == marker["archive_sha256"]
+    assert bundle["sha256"] == hashlib.sha256(Path(bundle["path"]).read_bytes()).hexdigest()
+
+
+def test_mrms_final_study_year_bundle_records_h1_period(tmp_path):
+    import json
+    import hashlib
+    import zipfile
+    from scripts.mirror_mrms_year_bundle import _build_bundle
+    from scripts.mirror_mrms_study_background import _year_months
+
+    product = mrms.DEFAULT_PRODUCTS[0]
+    archive = tmp_path / "local" / "raw.zarr.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"monthly")
+    marker_path = archive.parent / "complete.json"
+    marker = {"stored_bytes": archive.stat().st_size,
+        "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "asset_ids": ["asset"], "observations": 1}
+    marker_path.write_text(json.dumps(marker))
+    bundle = _build_bundle(2026, product,
+        {"mrms/example/2026/06/raw.zarr.zip": {
+            "archive": archive, "marker_path": marker_path, "marker": marker,
+            "member": "data/example.zip", "marker_member": "metadata/example.json",
+            "selected_by": ["2026-06"]}}, [], tmp_path / "out", tmp_path)
+    with zipfile.ZipFile(bundle["path"]) as package:
+        manifest = json.loads(package.read("year_manifest.json"))
+    assert manifest["requested_study_period"] == [
+        "2026-01-01T00:00:00Z", "2026-07-01T00:00:00Z"]
+    assert len(_year_months(2026)) == 6
+
+
+def test_yearly_bundle_retains_zero_byte_noaa_source_as_coverage_metadata(tmp_path):
+    import hashlib
+    import json
+    from scripts.mirror_mrms_year_bundle import _collect_year
+
+    product = mrms.DEFAULT_PRODUCTS[1]
+    study = tmp_path / "study"
+    source_root = tmp_path / "local"
+    for month in range(1, 13):
+        key = f"2023-{month:02d}"
+        folder = study / "months" / key
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in mrms.DEFAULT_PRODUCTS:
+            row = {"status": "unavailable", "month": key, "product": name}
+            if key == "2023-05" and name == product:
+                good_id, empty_id = "good-id", "empty-id"
+                rows = [good_id]
+                archive = source_root / "mrms" / name / "2023" / "05" / "raw.zarr.zip"
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                archive.write_bytes(b"archive")
+                marker = {"source": "mrms", "product": name, "raw_path": archive.name,
+                    "observations": 1, "asset_ids": rows,
+                    "stored_bytes": archive.stat().st_size,
+                    "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}
+                (archive.parent / "complete.json").write_text(json.dumps(marker))
+                row = {"status": "complete", "month": key, "product": name,
+                    "archives": [str(archive)], "listed_slots": 2, "matched_slots": 1,
+                    "invalid_source_files": [{"asset_id": empty_id,
+                        "key": "CARIB/empty.grib2.gz", "observation_time": "2023-05-24T07:00:00Z",
+                        "etag": "d41d8cd98f00b204e9800998ecf8427e", "size": 0,
+                        "reason": "zero_byte_noaa_object"}]}
+                selection = {"features": [
+                    {"id": good_id, "properties": {"ecore:source": {"size": 12}}},
+                    {"id": empty_id, "properties": {"ecore:source": {
+                        "key": "CARIB/empty.grib2.gz", "time": "2023-05-24T07:00:00Z",
+                        "etag": "d41d8cd98f00b204e9800998ecf8427e", "size": 0}}}]}
+                (folder / f"{name}-selection").mkdir()
+                (folder / f"{name}-selection" / "items.json").write_text(json.dumps(selection))
+            (folder / f"{name}.json").write_text(json.dumps(row))
+
+    grouped, selections = _collect_year(2023, source_root, study)
+
+    assert set(grouped[product])
+    assert {entry["member"].split("/", 1)[0] for entry in selections[product]} == {
+        "selections", "coverage"}
+
+
+def test_legacy_cleanup_plan_never_targets_goes(tmp_path):
+    from scripts.cleanup_legacy_archives import mrms_deletion_plan
+
+    product = mrms.DEFAULT_PRODUCTS[0]
+    v2_root = tmp_path / "ecore_eo_datasets_zarrV2"
+    roi = v2_root / product / "roi-legacy"
+    marker_dir = roi / "2022" / "01" / "01" / "20220101T000000"
+    marker_dir.mkdir(parents=True)
+    (roi / "subset.json").write_text(json.dumps({"source": "mrms",
+        "product": product, "subset_id": "legacy"}))
+    (marker_dir / "complete.json").write_text(json.dumps({"asset_id": "old-asset",
+        "subset_id": "legacy", "selection_id": "old-selection",
+        "source_url": f"https://example.invalid/{product}/old.grib2"}))
+    goes_roi = v2_root / "GOES-16" / "roi-legacy"
+    goes_roi.mkdir(parents=True)
+    (goes_roi / "keep.txt").write_text("legacy GOES stays until replacement")
+
+    legacy, _, _, v2_legacy, _, _ = mrms_deletion_plan(tmp_path / "dataset", v2_root)
+    assert [row["directory"] for row in v2_legacy] == [str(roi.resolve())]
+    assert [row["directory"] for row in legacy] == [str(roi.resolve())]
+    assert (goes_roi / "keep.txt").is_file()
+
+
+def test_run_config_history_preserves_previous_product_selection(tmp_path):
+    from scripts.fetch_mrms_study import _record_run_config
+
+    old = {"products": ["PrecipRate_00.00", "MultiSensor_QPE_01H_Pass1_00.00"]}
+    new = {"products": list(mrms.DEFAULT_PRODUCTS)}
+    _record_run_config(tmp_path, old)
+    _record_run_config(tmp_path, new)
+
+    assert json.loads((tmp_path / "run_config.json").read_text()) == new
+    history = list((tmp_path / "run-config-history").glob("*.json"))
+    assert len(history) == 1
+    assert json.loads(history[0].read_text()) == old
+
+
+def test_handoff_waits_for_each_requested_product_month(tmp_path):
+    from types import SimpleNamespace
+    from scripts.handoff_mrms_supervisor import _month_is_complete, _watch_command
+
+    month = tmp_path / "months" / "2021-08"
+    products = ["PrecipRate_00.00", "MultiSensor_QPE_01H_Pass2_00.00"]
+    assert not _month_is_complete(tmp_path, "2021-08", products)
+    month.mkdir(parents=True)
+    for product in products:
+        archive = tmp_path / product / "raw.zarr.zip"
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"archive")
+        (archive.parent / "complete.json").write_text(json.dumps({
+            "product": product, "raw_path": archive.name,
+            "stored_bytes": archive.stat().st_size, "archive_sha256": "verified"}))
+        (month / f"{product}.json").write_text(json.dumps({
+            "month": "2021-08", "product": product, "status": "complete",
+            "archives": [str(archive)]}))
+    assert _month_is_complete(tmp_path, "2021-08", products)
+    args = SimpleNamespace(old_parent=1, old_child=2, old_snapshot="old",
+        new_snapshot="new", destination="das", output="out", scratch="scratch",
+        status="status.json", log="handoff.log", stop_after_month="2021-08",
+        stop_products=products)
+    command = _watch_command(args)
+    assert command[command.index("--stop-after-month") + 1] == "2021-08"
+    assert command[command.index("--stop-products") + 1:command.index("--watch")] == products
+
+
+def test_goes_stager_reuses_only_matching_saved_selection(tmp_path):
+    from scripts.fetch_goes_staged import _reusable_selection
+
+    start, end = "2026-01-01", "2026-02-01"
+    asset = Asset("noaa-goes19", "ABI-L2-CMIPF/2026/001/00/OR_ABI-L2-CMIPF-M6C01_G19_s20260010000200.nc",
+                  1024, "etag", "2026-01-01T00:00:20Z")
+    selection = Selection("goes", "ABI-L2-CMIPF", start, end,
+        (-70.24, 14.36, -62.56, 22.04), [asset], bands=(1, 2, 3, 7, 8, 9, 10, 13),
+        satellite=19)
+    saved = tmp_path / "ABI-L2-CMIPF"
+    save_selection(selection, saved)
+
+    assert _reusable_selection(tmp_path, start, end) == saved / "items.json"
+    assert _reusable_selection(tmp_path, start, "2026-03-01") is None
 
 
 def radar(values, product=mrms.DEFAULT_PRODUCT):
@@ -37,6 +337,16 @@ def test_negative_reflectivity_is_valid_and_bitmap_is_separate():
     ds.bitmap_valid.values[1, 1] = 0
     codes, _ = diagnostics.classify(ds, "measurement")
     np.testing.assert_array_equal(codes, [[0, 1], [2, 3]])
+
+
+def test_azimuthal_shear_zero_remains_ambiguous():
+    ds = radar([[0, 0], [1, -1]], "MergedAzShear_0-2kmAGL_00.50")
+    ds.bitmap_valid.values[0, 1] = 0
+    codes, _ = diagnostics.classify(ds, "measurement")
+    np.testing.assert_array_equal(codes, [[7, 3], [0, 0]])
+    row = diagnostics.describe(ds, {"all": (-69, 16, -64, 20)}).iloc[0]
+    assert row.ambiguous_shear_zero_count == 1
+    assert row.valid_zero_count == 0
 
 
 def test_all_invalid_patch_and_outside_patch():
@@ -118,6 +428,120 @@ def test_goes_scan_time_and_sample_selection():
     assert [a.time[:10] for a in picked] == ["2022-09-18"]*2+["2022-09-21"]*2+["2022-09-24"]*2
 
 
+def test_monthly_zarr_source_exposes_saved_native_values(monkeypatch):
+    from contextlib import nullcontext
+    from ecore_weather import earth2_sources
+    ds = radar([[0, -1], [2, 3]])
+    ds = ds.expand_dims(time=[np.datetime64("2024-09-15T00:00:00")])
+    monkeypatch.setattr("ecore_weather.storage.open_raw", lambda _path: nullcontext(ds))
+    source = earth2_sources.MonthlyZarrSource("archive.zip", "mrms",
+        product=mrms.DEFAULT_PRODUCT)
+    actual = source(["2024-09-15T00:02:00"], ["qpe_1h"])
+    assert actual.dims == ("time", "variable", "latitude", "longitude")
+    assert actual.coords["variable"].values.tolist() == ["qpe_1h"]
+    np.testing.assert_array_equal(actual.isel(time=0, variable=0), ds.measurement.isel(time=0))
+
+    packed = xr.Dataset({"CMI_C13": (("y", "x"), np.array([[100, -1], [200, 300]], "int16")),
+                         "DQF_C13": (("y", "x"), np.array([[0, 3], [1, 0]], "int8"))},
+                        coords={"x": [0, 1], "y": [0, 1]}).expand_dims(
+                            time=[np.datetime64("2025-09-15T12:00:00")])
+    monkeypatch.setattr("ecore_weather.storage.open_raw", lambda _path: nullcontext(packed))
+    source = earth2_sources.MonthlyZarrSource("goes.zip", "goes", band=13)
+    actual = source(["2025-09-15T12:02:00"], ["abi13c"])
+    assert actual.dims == ("time", "variable", "y", "x")
+    assert actual.coords["variable"].values.tolist() == ["abi13c"]
+    assert actual.dtype == np.dtype("int16")
+    np.testing.assert_array_equal(actual.isel(time=0, variable=0), packed.CMI_C13.isel(time=0))
+
+
+def test_live_datasource_reports_actual_observation_time(monkeypatch):
+    from ecore_weather import earth2_sources
+    source = earth2_sources.MRMSCaribbeanSource(product="PrecipRate_00.00")
+    raw = radar([[1, 2]], product="PrecipRate_00.00")
+    raw.attrs["observation_time"] = "2021-01-01T00:08:00Z"
+    monkeypatch.setattr(source, "read_dataset", lambda _time: raw)
+    result = source("2021-01-01T00:10:00Z", "precip_rate")
+    assert str(result.time.values[0]).startswith("2021-01-01T00:08:00")
+
+    goes_source = earth2_sources.GOESCaribbeanSource(band=13)
+    packed = xr.Dataset({"CMI": (("y", "x"), np.array([[10]], dtype="int16"))},
+                        coords={"y": [0], "x": [0]},
+                        attrs={"observation_time": "2021-01-01T00:00:20Z"})
+    monkeypatch.setattr(goes_source, "read_dataset", lambda _time: packed)
+    result = goes_source("2021-01-01T00:02:00Z", "abi13c")
+    assert str(result.time.values[0]).startswith("2021-01-01T00:00:20")
+
+
+def test_earth2studio_writer_keeps_native_dtype_and_bitmap(tmp_path):
+    pytest.importorskip("earth2studio")
+    from ecore_weather.earth2_io import write_dataset
+    source = radar([[0, -1], [2, 3]]).expand_dims(
+        time=[np.datetime64("2021-01-01T00:00:00")])
+    source.bitmap_valid.values[0, 1, 0] = 0
+    path = tmp_path / "native.zarr"
+    write_dataset(source, path)
+    with open_raw(path) as reopened:
+        for name in ("measurement", "bitmap_valid", "time", "latitude", "longitude"):
+            np.testing.assert_array_equal(reopened[name].values, source[name].values)
+            assert reopened[name].dtype == source[name].dtype
+
+
+def test_streaming_month_merges_without_duplicate_observations(tmp_path, monkeypatch):
+    pytest.importorskip("earth2studio")
+    import json
+    from ecore_weather import monthly_stream
+    first = Asset("bucket", "CARIB/PrecipRate_00.00/20210101/a.grib2.gz", 5, "a",
+                  "2021-01-01T00:00:00Z")
+    second = Asset("bucket", "CARIB/PrecipRate_00.00/20210101/b.grib2.gz", 5, "b",
+                   "2021-01-01T00:10:00Z")
+    selection = Selection("mrms", "PrecipRate_00.00", "2021-01-01", "2021-02-01",
+                          (-70, 14, -62, 22), [first, second])
+
+    def fake_read(asset, *_args):
+        ds = radar([[0, -1], [2, 3]])
+        ds.measurement.values[0, 0] = 1 if asset.id == first.id else 2
+        ds.bitmap_valid.values[0, 1] = 0
+        ds["calibration_note"] = xr.DataArray(np.int16(7))
+        return ds, {}
+
+    monkeypatch.setattr(monthly_stream, "_read_new", fake_read)
+    target = tmp_path / "month"
+    assert monthly_stream._write_one(selection, [first], target, None, workers=1)["status"] == "saved"
+    assert monthly_stream._write_one(selection, [first, second], target, None, workers=1)["status"] == "saved"
+    assert monthly_stream._write_one(selection, [first, second], target, None, workers=1)["status"] == "reused"
+    with open_raw(target / "raw.zarr.zip") as stored:
+        assert stored.sizes["time"] == 2
+        assert stored.measurement.values[:, 0, 0].tolist() == [1, 2]
+        assert stored.bitmap_valid.values[:, 0, 1].tolist() == [0, 0]
+        meta = json.loads(str(stored.source_metadata_json.values[1]))
+        assert meta["variables"]["calibration_note"]["values"] == 7
+
+
+def test_monthly_stream_bounds_source_read_concurrency():
+    from ecore_weather.monthly_stream import source_read_workers
+    assert [source_read_workers(n) for n in (1, 4, 16, 32)] == [1, 4, 16, 16]
+
+
+def test_goes_study_inventory_scenarios_use_one_listing(monkeypatch):
+    from ecore_weather import study_goes
+    from datetime import datetime, timedelta, timezone
+    day = datetime(2021, 1, 1, tzinfo=timezone.utc)
+    assets = []
+    for band in range(1, 17):
+        for minute in range(0, 60, 10):
+            stamp = day + timedelta(minutes=minute)
+            code = stamp.strftime("%Y%j%H%M%S") + "0"
+            key = f"ABI-L2-CMIPF/2021/001/00/OR_ABI-L2-CMIPF-M6C{band:02d}_G16_s{code}_e{code}_c{code}.nc"
+            assets.append(Asset("noaa-goes16", key, 100, "etag", stamp.isoformat()))
+    listed = []
+    monkeypatch.setattr(study_goes, "_day_assets", lambda d, _client: listed.append(d) or assets)
+    row = study_goes.inventory_month(day, day + timedelta(days=1), client=object())
+    assert len(listed) == 1
+    assert [row["scenarios"][name]["band_files"] for name in
+            ("eight_6ph", "eight_3ph", "eight_1ph", "sixteen_6ph")] == [48, 24, 8, 96]
+    assert row["scenarios"]["eight_6ph"]["listed_full_file_bytes"] == 4800
+
+
 def test_fetch_resume_and_failure_cleanup(tmp_path, monkeypatch):
     from ecore_weather import storage
     good = Asset('b', 'good', 1, 'e', '2024-09-15T00:00:00Z')
@@ -163,6 +587,102 @@ def test_storage_requires_explicit_destination():
         destination_root('s3://unsupported-durable-destination')
 
 
+def test_remote_month_name_is_limited_to_verified_versioned_zarr():
+    assert valid_raw_name("raw.zarr.zip")
+    assert valid_raw_name("raw-" + "a" * 32 + ".zarr")
+    assert not valid_raw_name("raw-../other.zarr")
+    assert not valid_raw_name("raw-" + "g" * 32 + ".zarr")
+
+
+def test_default_hf_fetch_dispatches_to_direct_async_writer(monkeypatch):
+    from ecore_weather import monthly
+    asset = Asset("b", "CARIB/PrecipRate_00.00/20210101/x.grib2.gz", 1, "e",
+                  "2021-01-01T00:00:00Z")
+    selection = Selection("mrms", "PrecipRate_00.00", "2021-01-01", "2021-02-01",
+                          (-70, 14, -62, 22), [asset])
+    calls = []
+    def write(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"status": "saved", "path": "hf://test/raw-" + "a" * 32 + ".zarr",
+                "stored_bytes": 123, "observations": 1, "read_bytes": 10,
+                "hf_upload_bytes": 123, "hf_upload_seconds": 1.5}
+    monkeypatch.setattr("ecore_weather.remote_async.write_selection_month", write)
+    report = monthly.fetch_remote_streaming(selection,
+        remote_root="hf://buckets/test/bucket/noaa-subsets", report_dir=None,
+        index_results=False)
+    assert len(calls) == 1
+    assert report["hf_upload_bytes"] == 123
+    assert report["monthly_archives"][0]["path"].endswith(".zarr")
+    assert "async Zarr" in report["storage_layout"]
+
+
+def test_remote_cleanup_only_targets_inactive_writer_archives(monkeypatch):
+    from ecore_weather import remote_async
+    active = "raw-" + "a" * 32 + ".zarr"
+    old = "raw-" + "b" * 32 + ".zarr"
+    class Client:
+        def list_objects_v2(self, **_kwargs):
+            return {"CommonPrefixes": [
+                {"Prefix": f"prefix/month/{active}/"},
+                {"Prefix": f"prefix/month/{old}/"},
+                {"Prefix": "prefix/month/other.zarr/"}],
+                "Contents": [{"Key": "prefix/month/complete.json"},
+                             {"Key": "prefix/month/raw.zarr.zip"}]}
+    class Writer:
+        client = Client()
+        config = {"bucket": "bucket"}
+        def key(self, value):
+            return "prefix/" + value
+    removed = []
+    monkeypatch.setattr(remote_async, "_delete_owned", lambda _writer, path: removed.append(path))
+    count = remote_async._cleanup_old_versions(Writer(), "month", active)
+    assert count == 2
+    assert sorted(removed) == sorted([f"month/{old}", "month/raw.zarr.zip"])
+
+
+def test_remote_object_listing_keeps_directory_boundary():
+    from ecore_weather.remote_async import _objects
+
+    class Client:
+        def list_objects_v2(self, **kwargs):
+            assert kwargs["Prefix"] == "prefix/month/raw-example.zarr/"
+            return {"Contents": [{"Key": kwargs["Prefix"] + "zarr.json"}]}
+
+    class Writer:
+        client = Client()
+        config = {"bucket": "bucket"}
+
+        def key(self, value):
+            return "prefix/" + value.strip("/")
+
+    assert len(list(_objects(Writer(), "month/raw-example.zarr/"))) == 1
+
+
+def test_earth2studio_async_partial_time_shard_flushes_on_close(tmp_path):
+    pytest.importorskip("earth2studio")
+    from collections import OrderedDict
+    from earth2studio.io import AsyncZarrBackend
+    from zarr.codecs import BloscCodec
+    import torch
+    import zarr
+    stamps = np.array([np.datetime64("2021-01-01T00:00") + np.timedelta64(10*i, "m")
+                       for i in range(13)])
+    coords = OrderedDict(time=stamps, latitude=np.array([18., 17.]),
+                         longitude=np.array([-67., -66.]))
+    io = AsyncZarrBackend(None, parallel_coords=OrderedDict(time=stamps),
+        store=str(tmp_path / "async.zarr"), blocking=False, pool_size=1,
+        shard_coords={"time": 12}, max_inflight_shards=2,
+        zarr_codecs=BloscCodec(cname="zstd", clevel=3, shuffle="shuffle"))
+    io.add_array(coords, "measurement", dtype=np.int16)
+    for i in range(13):
+        selected = OrderedDict((name, value[i:i+1] if name == "time" else value)
+                               for name, value in coords.items())
+        io.write(torch.full((1, 2, 2), i, dtype=torch.int16), selected, "measurement")
+    io.close()
+    group = zarr.open_group(str(tmp_path / "async.zarr"), mode="r")
+    np.testing.assert_array_equal(group["measurement"][:, 0, 0], np.arange(13))
+
+
 def test_hour_matching_preserves_actual_time_and_prevents_future_default():
     assets = [Asset("b", str(i), 1, "e", t) for i, t in enumerate([
         "2022-09-24T16:58:00Z", "2022-09-24T18:02:00Z"])]
@@ -174,7 +694,7 @@ def test_hour_matching_preserves_actual_time_and_prevents_future_default():
     assert not mrms.match_hours(assets, slots, method="exact")[0]
     assert len(mrms.match_hours(assets, slots, method="nearest")[0]) == 2
     with pytest.raises(ValueError):
-        mrms.match_hours(assets, slots, tolerance_minutes=30)
+        mrms.match_hours(assets, slots, tolerance_minutes=31)
 
 
 def test_compact_catalog_retains_hour_matches(tmp_path):
@@ -201,6 +721,11 @@ def test_cli_and_satellite_defaults():
     assert default_workers() == max(1, multiprocessing.cpu_count()//2)
     args = parser("mrms").parse_args(["--period", "2025", "--workers", "3", "--save-figures", "plots"])
     assert args.workers == 3 and args.save_figures == "plots"
+    assert args.monthly_writers == 2
+    assert args.product is None
+    assert parser("goes").parse_args([]).bands == [1, 2, 3, 7, 8, 9, 10, 13]
+    assert parser("goes").parse_args([]).product is None
+    assert parser("goes").parse_args([]).scans_per_hour == 0
     assert goes.east_satellite("2022-09-01", "2022-12-01") == 16
     assert goes.east_satellite("2025-09-01", "2025-12-01") == 19
     with pytest.raises(ValueError):
@@ -321,6 +846,85 @@ def test_hf_writer_serializes_threads():
     assert peak == 1
 
 
+def test_hf_scoped_writer_allows_disjoint_months_but_locks_same_month():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+    from ecore_weather.hf_storage import bucket_writer
+    import time
+
+    barrier = Barrier(2)
+    def disjoint(scope):
+        with bucket_writer("unit-test/scoped", scope=scope):
+            barrier.wait(timeout=2)
+    with ThreadPoolExecutor(2) as pool:
+        list(pool.map(disjoint, ("mrms/p/2021/01", "mrms/p/2021/02")))
+
+    active = peak = 0
+    guard = Lock()
+    def same_month(_):
+        nonlocal active, peak
+        with bucket_writer("unit-test/scoped", scope="mrms/p/2021/01"):
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(.01)
+            with guard:
+                active -= 1
+    with ThreadPoolExecutor(2) as pool:
+        list(pool.map(same_month, range(2)))
+    assert peak == 1
+
+    # A scoped writer must also coordinate with older bucket-wide publishers.
+    active = peak = 0
+    global_guard = Lock()
+    def global_and_month(scope):
+        with bucket_writer("unit-test/global-scope", scope=scope):
+            nonlocal active, peak
+            with global_guard:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(.01)
+            with global_guard:
+                active -= 1
+    with ThreadPoolExecutor(2) as pool:
+        list(pool.map(global_and_month, (None, "mrms/p/2021/01")))
+    assert peak == 1
+
+
+def test_hf_month_mirror_batches_are_bounded_and_checkpoint_per_archive(tmp_path, monkeypatch):
+    from threading import Lock
+    import time
+    from scripts import mirror_mrms_year
+
+    active = peak = 0
+    guard = Lock()
+    def fake_mirror(archive, marker, remote_root, relative, progress=None):
+        nonlocal active, peak
+        with guard:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(.02)
+        with guard:
+            active -= 1
+        if relative.endswith("2021/02"):
+            raise OSError("synthetic upload failure")
+        return {"status": "saved", "path": remote_root+"/"+relative,
+            "observations": 12, "stored_bytes": 4096}
+    monkeypatch.setattr(mirror_mrms_year, "mirror_local_month", fake_mirror)
+    archives = {f"mrms/p/roi/2021/{month:02d}": {
+        "archive": tmp_path/f"{month:02d}.zip", "marker": {}, "selected_by": []}
+        for month in (1, 2, 3)}
+
+    summary, errors, pending = mirror_mrms_year._publish_batches(
+        archives, "hf://buckets/u/b/data", tmp_path/"reports", 2)
+
+    assert peak == 2
+    assert len(summary) == 1 and summary[0]["archive"].endswith("2021/01")
+    assert errors and errors[0]["product_month"].endswith("2021/02")
+    assert pending == ["mrms/p/roi/2021/03"]
+    assert (tmp_path/"reports"/"archives"/"mrms/p/roi/2021/01.json").is_file()
+
+
 def test_zip_container_preserves_arrays_metadata_and_removes_directory(tmp_path):
     from ecore_weather.storage import pack_raw, metadata_fingerprint
     ds = radar([[0,-1],[-3,4]])
@@ -378,19 +982,23 @@ def test_widget_products_hide_conus_and_cheatsheet_collapsed():
     from ecore_weather import ui
     controls = ui.selection_controls("goes")
     options = controls["product"].options
-    assert "ABI-L2-MCMIPF" in options and "ABI-L2-CMIPF" in options
-    assert not any(option.endswith("C") for option in options)
+    product_values = [option[1] for option in options]
+    assert "ABI-L2-MCMIPF" in product_values and "ABI-L2-CMIPF" in product_values
+    assert not any(option.endswith("C") for option in product_values)
     cheatsheet = controls["cheatsheet"]
     assert isinstance(cheatsheet, widgets.Accordion)
     assert cheatsheet.selected_index is None
     html = cheatsheet.children[0].value
     assert "ABI-L2-MCMIPF" in html and "CONUS" in html and "C13" in html
+    assert controls["product"].value == "ABI-L2-CMIPF"
+    assert tuple(controls["bands"].value) == goes.STORMSCOPE_BANDS
+    assert all("µm" in label for label, _ in controls["bands"].options)
 
 
 def test_mrms_cheatsheet_lists_products_and_sentinels():
     from ecore_weather import ui
     controls = ui.selection_controls("mrms")
-    assert list(controls["product"].options) == list(mrms.PRODUCTS)
+    assert set(value for _, value in controls["product"].options) == set(mrms.DEFAULT_PRODUCTS)
     cheatsheet = controls["cheatsheet"]
     assert cheatsheet.selected_index is None
     html = cheatsheet.children[0].value
@@ -590,11 +1198,11 @@ def test_cli_scans_per_hour_default_and_all():
     from ecore_weather.cli import parser
     goes_parser = parser("goes")
     args = goes_parser.parse_args([])
-    assert args.scans_per_hour == 1
+    assert args.scans_per_hour == 0
     assert goes_parser.parse_args(["--scans-per-hour", "0"]).scans_per_hour == 0
     controls = __import__("ecore_weather.ui", fromlist=["ui"]).selection_controls("goes")
-    assert controls["scans_per_hour"].value == 1
-    assert controls["scans_per_hour"].min == 1 and controls["scans_per_hour"].max == 6
+    assert controls["scans_per_hour"].value == 0
+    assert controls["bands"].value == goes.STORMSCOPE_BANDS
 
 
 def _synthetic_frame(time="2022-09-07T00:00:00Z"):

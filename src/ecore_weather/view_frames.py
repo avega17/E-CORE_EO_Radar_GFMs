@@ -1,6 +1,7 @@
 """Bounded display frames for Leaflet and animations; never modify stored rasters."""
 import base64
 import io
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -8,40 +9,67 @@ import numpy as np
 from .storage import open_raw
 
 
-def frame(path, variable=None, quality=True, hide_zero=False, pixels=384):
+def open_observation(record):
+    """Open a legacy single-file store or one timestamp from a monthly archive."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def opened():
+        path = (record.get("path") or record.get("url")) if isinstance(record, dict) else str(record)
+        if not path:
+            raise ValueError("Observation record has no archive path or URL")
+        dataset = open_raw(path)
+        try:
+            if isinstance(record, dict) and "time" in dataset.dims:
+                stamp = np.datetime64(record["time"].replace("Z", ""))
+                dataset = dataset.sel(time=stamp, drop=False)
+            yield dataset
+        finally:
+            dataset.close()
+    return opened()
+
+
+def _frame_dataset(ds, record=None, path=None, variable=None, quality=True,
+                   hide_zero=False, pixels=384):
     import rioxarray
     from rasterio.enums import Resampling
     from rasterio.transform import from_bounds
     from pyproj import Transformer
     from . import diagnostics, goes
-    with open_raw(path) as ds:
-        variable=variable or ('measurement' if 'measurement' in ds else goes.science_variables(ds)[0])
-        if variable not in ds:
-            raise ValueError(f'{variable} is not saved in this subset. Choose another band or dataset.')
-        codes,physical=diagnostics.classify(ds,variable)
-        arr=physical.astype('float32').copy(deep=True)
-        if quality: arr.values[codes.values!=0]=np.nan
-        if hide_zero: arr.values[arr.values==0]=np.nan
-        bbox=tuple(ds.attrs.get('requested_bbox',()))
-        if variable=='measurement':
-            arr=arr.assign_coords(longitude=(arr.longitude+180)%360-180).rename(longitude='x',latitude='y')
-            arr=arr.rio.write_crs('EPSG:4326')
-            if not bbox:bbox=(float(arr.x.min()),float(arr.y.min()),float(arr.x.max()),float(arr.y.max()))
-        else:
-            crs,height=goes.projection(ds)
-            arr=arr.assign_coords(x=goes._physical_coordinate(ds.x)*height,y=goes._physical_coordinate(ds.y)*height).rio.write_crs(crs)
-            if not bbox:
-                lon,lat=goes.lonlat(ds);bbox=(float(np.nanmin(lon)),float(np.nanmin(lat)),float(np.nanmax(lon)),float(np.nanmax(lat)))
-        west,south,east,north=bbox
-        if not (-85<south<north<85):raise ValueError('The interactive map supports regions within Web Mercator latitude limits.')
-        transform=Transformer.from_crs('EPSG:4326','EPSG:3857',always_xy=True)
-        left,bottom=transform.transform(west,south);right,top=transform.transform(east,north)
-        projected=arr.rio.write_nodata(np.nan).rio.reproject('EPSG:3857',shape=(pixels,pixels),
-                    transform=from_bounds(left,bottom,right,top,pixels,pixels),resampling=Resampling.nearest)
-        label=variable if variable!='CMI' else f'CMI C{int(ds.band_id.values.item()):02d}'
-        return {'values':projected.values,'bbox':bbox,'extent':(left,right,bottom,top),
-                'time':ds.attrs.get('observation_time',ds.attrs.get('time_coverage_start','')),
-                'label':label,'units':physical.attrs.get('units',''),'path':str(path)}
+    variable=variable or ('measurement' if 'measurement' in ds else goes.science_variables(ds)[0])
+    if variable not in ds:
+        raise ValueError(f'{variable} is not saved in this subset. Choose another band or dataset.')
+    codes,physical=diagnostics.classify(ds,variable)
+    arr=physical.astype('float32').copy(deep=True)
+    if quality: arr.values[codes.values!=0]=np.nan
+    if hide_zero: arr.values[arr.values==0]=np.nan
+    bbox=tuple(ds.attrs.get('requested_bbox',()))
+    if variable=='measurement':
+        arr=arr.assign_coords(longitude=(arr.longitude+180)%360-180).rename(longitude='x',latitude='y')
+        arr=arr.rio.write_crs('EPSG:4326')
+        if not bbox:bbox=(float(arr.x.min()),float(arr.y.min()),float(arr.x.max()),float(arr.y.max()))
+    else:
+        crs,height=goes.projection(ds)
+        arr=arr.assign_coords(x=goes._physical_coordinate(ds.x)*height,y=goes._physical_coordinate(ds.y)*height).rio.write_crs(crs)
+        if not bbox:
+            lon,lat=goes.lonlat(ds);bbox=(float(np.nanmin(lon)),float(np.nanmin(lat)),float(np.nanmax(lon)),float(np.nanmax(lat)))
+    west,south,east,north=bbox
+    if not (-85<south<north<85):raise ValueError('The interactive map supports regions within Web Mercator latitude limits.')
+    transform=Transformer.from_crs('EPSG:4326','EPSG:3857',always_xy=True)
+    left,bottom=transform.transform(west,south);right,top=transform.transform(east,north)
+    projected=arr.rio.write_nodata(np.nan).rio.reproject('EPSG:3857',shape=(pixels,pixels),
+                transform=from_bounds(left,bottom,right,top,pixels,pixels),resampling=Resampling.nearest)
+    label=variable if variable!='CMI' else f'CMI C{int(ds.band_id.values.item()):02d}'
+    return {'values':projected.values,'bbox':bbox,'extent':(left,right,bottom,top),
+            'time':record.get('time') if record else ds.attrs.get('observation_time',ds.attrs.get('time_coverage_start','')),
+            'label':label,'units':physical.attrs.get('units',''),
+            'path':str((record.get('path') or record.get('url')) if record else path)}
+
+
+def frame(path, variable=None, quality=True, hide_zero=False, pixels=384):
+    record = path if isinstance(path, dict) else None
+    with open_observation(path) as ds:
+        return _frame_dataset(ds, record, path, variable, quality, hide_zero, pixels)
 
 
 def limits(frames):
@@ -66,17 +94,42 @@ def png(frame, scale):
 def prepare(records, variable=None, quality=True, hide_zero=False, pixels=384, progress=None, max_frames=1500):
     if not records:raise ValueError('No observations match this view.')
     if len(records)>max_frames:raise ValueError(f'{len(records)} frames exceed the {max_frames}-frame display limit. Shorten the period or reduce images per day.')
-    frames=[]
-    for i,row in enumerate(records):
-        f=frame(row['path'],variable,quality,hide_zero,pixels)
-        f['time']=row['time'];frames.append(f)
-        if progress:progress(i+1,len(records),{'status':'prepared'})
+    # A multi-day sequence often revisits the same handful of monthly ZIP
+    # stores. Open each store once, then select all its requested time slices;
+    # reopening a ZipStore for every frame repeats metadata and file setup.
+    grouped=defaultdict(list)
+    for index,row in enumerate(records):
+        path=(row.get('path') or row.get('url')) if isinstance(row,dict) else str(row)
+        grouped[path].append((index,row))
+    frames=[None]*len(records)
+    completed=0
+    for path,items in grouped.items():
+        # The record-aware helper narrows to that record's timestamp. Here we
+        # need the whole monthly store so each requested observation can be
+        # selected independently below.
+        with open_observation(path) as ds:
+            for index,row in items:
+                if isinstance(row,dict) and 'time' in row and 'time' in ds.dims:
+                    stamp=np.datetime64(row['time'].replace('Z',''))
+                    selected=ds.sel(time=stamp,drop=False)
+                else:
+                    selected=ds
+                f=_frame_dataset(selected,row,path,variable,quality,hide_zero,pixels)
+                f['time']=row['time'] if isinstance(row,dict) and 'time' in row else f['time']
+                frames[index]=f
+                completed+=1
+                if progress:progress(completed,len(records),{'status':'prepared'})
     if len({tuple(f['bbox']) for f in frames})!=1:raise ValueError('Choose one dataset/region for an animation.')
     return frames
 
 
 def leaflet(frames):
-    """Preload PNGs once; Play changes the overlay without reading Zarr again."""
+    """Preload PNGs once; Play changes the overlay without reading Zarr again.
+
+    Python observers on both controls update the Leaflet URL directly. This
+    keeps playback working in notebook frontends where linked controls do not
+    reliably trigger the image layer's URL update.
+    """
     import html
     import ipywidgets as w
     from ipyleaflet import Map, ImageOverlay, LayersControl, basemaps
@@ -87,19 +140,39 @@ def leaflet(frames):
           basemap=basemaps.OpenStreetMap.Mapnik,layout=w.Layout(height='500px'))
     overlay=ImageOverlay(url=urls[0],bounds=bounds,name=frames[0]['label'],opacity=.8)
     m.add(overlay);m.add(LayersControl(position='topright'));m.fit_bounds(bounds)
-    title=w.HTML();slider=w.IntSlider(min=0,max=len(frames)-1,value=0,description='Frame',continuous_update=False)
+    title=w.HTML();slider=w.IntSlider(min=0,max=len(frames)-1,value=0,description='Frame',continuous_update=True)
     play=w.Play(min=0,max=len(frames)-1,value=0,interval=500,disabled=len(frames)==1)
-    link=w.jslink((play,'value'),(slider,'value'))
-    def update(change):
-        i=change['new'];overlay.url=urls[i]
+    # Keep the frame renderer directly subscribed to Play as well as the
+    # slider. A kernel-side widget link alone can update the slider while the
+    # Leaflet ImageOverlay remains on its first URL in some notebook frontends.
+    last_index={'value':None}
+    def update_index(i):
+        i=int(i)
+        if i==last_index['value']:
+            return
+        last_index['value']=i
+        overlay.url=urls[i]
         title.value=f"<b>{html.escape(frames[i]['label'])}</b> · {html.escape(frames[i]['time'])} UTC · {i+1}/{len(frames)}"
-    slider.observe(update,names='value');update({'new':0})
+    def update_from_play(change):
+        i=change['new']
+        if slider.value!=i:
+            slider.value=i
+        update_index(i)
+    def update_from_slider(change):
+        i=change['new']
+        if play.value!=i:
+            play.value=i
+        update_index(i)
+    play.observe(update_from_play,names='value')
+    slider.observe(update_from_slider,names='value')
+    update_index(0)
     legend=w.HTML(f"<small>Fixed scale for all frames: {scale[0]:.3g}–{scale[1]:.3g} {html.escape(str(frames[0]['units']))}. "
                   "Transparent pixels are hidden for display. Basemap © OpenStreetMap contributors.</small>"
                   "<div style='width:240px;height:10px;background:linear-gradient(to right,#440154,#3b528b,#21918c,#5ec962,#fde725)'></div>")
     panel=w.VBox([title,m,w.HBox([play,slider]),legend])
-    # Keep the link and preloaded frames reachable while this panel is displayed.
-    panel._ecore_link=link
+    # Keep the controls and preloaded frames reachable while this panel is displayed.
+    panel._ecore_play=play
+    panel._ecore_slider=slider
     panel._ecore_frames=frames
     return panel
 

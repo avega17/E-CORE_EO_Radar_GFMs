@@ -1,14 +1,17 @@
 # %% [markdown]
-# # MRMS: raw rainfall, hourly matching, and Caribbean coverage
-# The example periods are September 1–December 1 in 2022 and 2025. Each contains
-# 2,184 hourly slots. The initial product is CARIB Pass2 hourly rainfall
-# accumulation, in millimetres over an hour—not instantaneous rain rate.
+# # MRMS: raw radar observations and Caribbean coverage
+# Choose a UTC period and native-grid Caribbean region below. The four default
+# fields are precipitation rate, composite reflectivity, low-level azimuthal
+# shear, and multisensor Pass2 one-hour QPE. Other MRMS products remain selectable.
+# Six are sampled on ten-minute slots; the multisensor products remain hourly.
 #
-# The default hourly match chooses the latest file at or before the slot, within
-# five minutes. A 16:58 file can therefore supply the 17:00 slot. Its actual
-# timestamp remains in the raw metadata; its slot and offset remain in the selection and run report.
-# Nothing is interpolated in time. Exact matching and nearest matching are options;
-# nearest can use a later observation, which must not enter an earlier model input.
+# Two-minute products use the latest available observation at or before each
+# ten-minute slot, within five minutes. Hourly products use hourly slots. Actual
+# source times and offsets stay alongside the request slots; gaps are not filled.
+#
+# As a script, `--product` accepts readable names such as `precipitation-rate`,
+# `composite-reflectivity`, `low-level-azimuthal-shear`, and
+# `multisensor-qpe-pass2`. The archive metadata still records NOAA's exact key.
 
 # %%
 if __name__ != "__mp_main__":  # Spawned readers must not construct notebook widgets.
@@ -66,7 +69,7 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
     from IPython.display import display
     if get_ipython() is not None:
         get_ipython().run_line_magic("matplotlib", "inline")
-    from ecore_weather import benchmark, catalog, diagnostics, storage, ui, validation, visualization
+    from ecore_weather import benchmark, catalog, diagnostics, storage, ui, validation, visualization, view_frames
     from ecore_weather.common import PATCHES
     SMOKE = os.getenv("ECORE_NOTEBOOK_SMOKE") == "1"
 
@@ -82,23 +85,26 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 #
 # The default durable destination is the HF bucket configured in `.env` or session
 # environment variables. Enter a local path to choose local storage explicitly.
-# STAC describes the selection using two JSON files in the run folder, rather
-# than creating one directory per observation. The current selection replaces
-# those two files; choose another run folder when you want to keep another selection.
-# A collapsed "Product and variable guide" below the controls lists every CARIB
-# precipitation and reflectivity product with its units and missing-value codes.
+# STAC describes each product selection. Monthly compressed Zarr archives use
+# stable product, region/grid, and month paths, so overlapping requests reuse
+# the same archive.
+# A collapsed "Product and variable guide" explains the available CARIB fields,
+# units, cadence, and missing-value codes. Azimuthal shear is a radar rotation
+# proxy; a zero in those products is ambiguous without bitmap/coverage context.
 
 # %%
 if __name__ != "__mp_main__":  # Spawned readers must not construct notebook widgets.
     controls = ui.selection_controls(SOURCE)
     display(controls["panel"])
     def choose_data():
-        selection = READER.discover(**ui.read_controls(controls))
-        display(selection.summary())
-        if selection.source == "goes":
-            display(READER.acquisition_coverage(selection))
-        print("Saved selection:", catalog.save_selection(selection, controls["output"].value))
-        return selection
+        request = ui.read_controls(controls)
+        products = request.pop("products")
+        selections = READER.discover_defaults(**request, products=products)
+        for selection in selections:
+            display(selection.summary())
+            product_dir = Path(controls["output"].value) / selection.product
+            print("Saved selection:", catalog.save_selection(selection, product_dir))
+        return selections
     chosen = ui.action("Find and save selection", choose_data)
 
 # %% [markdown]
@@ -110,23 +116,28 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # remote read-back check and is measured separately from source reads and writing.
 #
 # Why Zarr: the mentor's scripts re-downloaded and re-decoded each hour on every
-# run, and their GeoTIFF output lost units, calibration, and missing-value
-# distinctions. We download each hour once and keep one lossless Zarr copy per
-# source object. MRMS files are gzip-compressed, so a remote file cannot be read
-# in parts; the cropped Zarr is what later steps actually read. The ZIP container
-# keeps one file per hour, which copies faster to shared drives and HPC systems
-# than thousands of tiny chunk files. See docs/raw_data_rationale.md.
+# run, and their GeoTIFF output lost units and missing-value distinctions. MRMS
+# gzip files must still be downloaded whole. Local fetching now streams bounded
+# source batches to separate monthly Earth2Studio Zarr stores; each month is
+# verified before its completion marker is written. HF publication has one
+# writer to keep request rates bounded.
 
 # %%
 if __name__ != "__mp_main__":  # Spawned readers must not construct notebook widgets.
     def fetch_data():
-        with ui.FetchProgress(len(chosen["value"].assets)) as progress:
-            report = storage.fetch(chosen["value"], destination=controls["destination"].value,
-                                   workers=controls["workers"].value, report_dir=controls["output"].value,
-                                   layout=controls["layout"].value, container=controls["container"].value, read_processes=controls["read_processes"].value,
-                                   scratch=controls["scratch"].value or None, progress=progress,
-                                   inspect=lambda ds: diagnostics.describe(ds).to_dict("records"))
-        successful = [r for r in report["records"] if r["status"] in ("saved", "reused")]
+        from ecore_weather import monthly
+        reports = []
+        for selection in chosen["value"]:
+            product_dir = Path(controls["output"].value) / selection.product
+            with ui.FetchProgress(len(selection.assets), selection.product) as progress:
+                report = monthly.fetch(selection, destination=controls["destination"].value,
+                    workers=controls["workers"].value, report_dir=product_dir,
+                    read_processes=controls["read_processes"].value,
+                    monthly_writers=controls["monthly_writers"].value,
+                    scratch=controls["scratch"].value or None, progress=progress)
+            reports.append(report)
+        report = {"records": [r for result in reports for r in result["records"]], "reports": reports}
+        successful = [r for r in report["records"] if r["status"] in ("archived", "reused")]
         controls["image_index"].max = max(0, len(successful)-1)
         display(dict(Counter(r["status"] for r in report["records"])))
         display(pd.DataFrame([r for r in report["records"] if r["status"] == "failed"]))
@@ -136,7 +147,8 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # %% [markdown]
 # ## Describe patches before processing
 # QPE uses -1 for missing data and -3 for no coverage. Zero rain is valid.
-# Other products have their own definitions; negative reflectivity can be valid.
+# Azimuthal-shear zero is ambiguous and is reported separately. Other products
+# have their own definitions; negative reflectivity can be valid.
 # The GRIB bitmap separately marks whether a source cell contains a measurement.
 # Statistics use valid pixels only. Missing hourly slots are reported by the
 # selection, separately from missing pixels. Empty patches have no statistics.
@@ -151,8 +163,8 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
         for row in rows:
             if "diagnostics" in row:
                 tables.extend(row["diagnostics"])
-            elif row["status"] in ("saved", "reused"):
-                with storage.open_raw(row["url"]) as raw:
+            elif row["status"] in ("archived", "reused"):
+                with view_frames.open_observation(row) as raw:
                     described = diagnostics.describe(raw).to_dict("records")
                     for record in described:
                         record["slot_time"] = row.get("slot_time", row["time"])
@@ -161,7 +173,8 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
         if not table.empty:
             table = table[table.patch.isin(patches.value)]
             display(table)
-            figure = diagnostics.plot_coverage(table, chosen["value"].expected_times)
+            slots = sorted({slot for selection in chosen["value"] for slot in selection.expected_times})
+            figure = diagnostics.plot_coverage(table, slots)
             display(figure)
             if controls["save_figures"].value:
                 folder = Path(controls["figure_dir"].value); folder.mkdir(parents=True, exist_ok=True)
@@ -191,9 +204,9 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
     center = widgets.Checkbox(value=False, description="Centered 512 × 512")
     display(widgets.HBox([recipe, center]))
     def show_image():
-        rows = [r for r in fetched["value"]["records"] if r["status"] in ("saved", "reused")]
+        rows = [r for r in fetched["value"]["records"] if r["status"] in ("archived", "reused")]
         row = rows[controls["image_index"].value]
-        with storage.open_raw(row["url"]) as raw:
+        with view_frames.open_observation(row) as raw:
             before = storage.fingerprint(raw)
             print("Source observation:", row["time"], "Hourly slot:", row.get("slot_time"))
             files = visualization.show_or_save(raw, controls["figure_dir"].value if controls["save_figures"].value else None,
@@ -219,11 +232,17 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # %%
 if __name__ != "__mp_main__":  # Spawned readers must not construct notebook widgets.
     def validate_data():
-        return validation.validate(chosen["value"], workers=controls["workers"].value,
-                                   report_path=Path(controls["output"].value)/"validation.json")
+        results = []
+        for selection in chosen["value"]:
+            if selection.product != mrms.DEFAULT_PRODUCT:
+                continue
+            results.append(validation.validate(selection, workers=controls["workers"].value,
+                report_path=Path(controls["output"].value)/selection.product/"validation.json"))
+        return results
     checks = ui.action("Validate selected period", validate_data)
     def compare_data(repeats=1):
-        table, details = benchmark.run_mrms(chosen["value"], report_dir=controls["output"].value,
+        selection = next(s for s in chosen["value"] if s.product == mrms.DEFAULT_PRODUCT)
+        table, details = benchmark.run_mrms(selection, report_dir=controls["output"].value,
                                             repeats=repeats, workers=controls["workers"].value, read_processes=controls["read_processes"].value)
         display(table)
         display(details.groupby(["variant", "status", "matches_legacy"]).size())
@@ -235,16 +254,16 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 if __name__ != "__mp_main__":  # Spawned readers must not construct notebook widgets.
     if SMOKE:
         import tempfile
-        chosen["value"] = mrms.discover("2022-09-24T17:00:00", "2022-09-24T18:00:00")
+        chosen["value"] = [mrms.discover("2022-09-24T17:00:00", "2022-09-24T18:00:00")]
         with tempfile.TemporaryDirectory(prefix="ecore-notebook-") as local:
             controls["destination"].value = local+"/data"
             controls["output"].value = local+"/run"
             controls["figure_dir"].value = local+"/figures"
             controls["save_figures"].value = True
             controls["workers"].value = 1
-            catalog.save_selection(chosen["value"], controls["output"].value)
+            catalog.save_selection(chosen["value"][0], controls["output"].value)
             fetched["value"] = fetch_data()
-            assert all(r["status"] == "saved" for r in fetched["value"]["records"])
+            assert all(r["status"] in ("archived", "reused") for r in fetched["value"]["records"])
             inspect_patches()
             assert show_image()
 

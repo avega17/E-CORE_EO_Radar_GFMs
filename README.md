@@ -1,15 +1,18 @@
 # NOAA radar and satellite subsets for Puerto Rico
 
-Research notebooks for checking the mentor's MRMS workflow, preserving raw NOAA
-subsets, and measuring whether range reads and virtual datasets help.
+This project prepares reproducible raw subsets from NOAA MRMS radar and GOES
+satellite archives for weather-forecasting research. The notebooks use custom
+Earth2Studio-compatible sources to retain the Puerto Rico region, requested
+products and bands, and native source metadata. They save validated, compressed
+monthly Zarr archives and keep analysis steps separate from the raw data.
 
-| Notebook | What it does |
+| Notebook | Description |
 | --- | --- |
-| [MRMS radar](notebooks/01_mrms.ipynb) · [Python source](notebooks/01_mrms.py) | Compare the original downloader, save raw radar subsets, and inspect Caribbean missing values. |
-| [GOES imagery](notebooks/02_goes.ipynb) · [Python source](notebooks/02_goes.py) | Select bands and a region, inspect quality, and compare full-file, range, and virtual reads. |
-| [Dataset viewer](notebooks/03_view_datasets.ipynb) · [Python source](notebooks/03_view_datasets.py) | Browse local or HF Zarr subsets, choose a variable, and display or export a geographic map. |
+| [MRMS radar](notebooks/01_mrms.ipynb) · [Python source](notebooks/01_mrms.py) | Select CARIB radar products, archive raw monthly subsets, and inspect coverage and missing-value codes. |
+| [GOES imagery](notebooks/02_goes.ipynb) · [Python source](notebooks/02_goes.py) | Select full-disk scans and ABI bands, archive native-grid subsets, and inspect data quality. |
+| [Dataset explorer](notebooks/03_03_explore_datasets.ipynb) · [Python source](notebooks/03_03_explore_datasets.py) | Browse monthly archives, prepare one month from an HF yearly backup, compare storage sizes, and preview samples or sequences on a map. |
 
-## Local setup
+## Set up
 
 ```bash
 conda env create -f environment.yml
@@ -17,62 +20,70 @@ conda activate ecore-weather
 python -m ipykernel install --user --name ecore-weather --display-name 'E-CORE weather'
 ```
 
-Open a notebook in Jupyter or VS Code and select the E-CORE weather kernel.
-Buttons make downloads and uploads explicit. The default examples use September
-1–December 1 in both 2022 and 2025 (UTC, ending date excluded).
+Set `HF_BUCKET_NAME=namespace/bucket`, Hub token credentials, and the separate HF
+S3 gateway keys in an untracked `.env` to use the default remote destination.
+`HF_DATASET_REPO` remains a compatibility alias for the bucket name. NOAA source
+reads are anonymous. Use a local path in the **Save to** control or
+`--destination PATH` for local archives. Read [storage and bucket access](docs/storage.md)
+before starting a large upload.
 
-Set `HF_BUCKET_NAME=ecore-eo-weather-GFMs` and `HF_TOKEN` in an untracked `.env` for the
-default Hugging Face destination. No AWS credentials
-are required for NOAA datasets. To save locally, enter a local directory in the notebook's
-**Save to** control. Authentication failures do not silently switch storage.
+MRMS defaults to four fields: precipitation rate, composite reflectivity, and
+low-level azimuthal shear sampled at ten-minute slots, plus multisensor Pass2
+QPE at hourly cadence. Other MRMS products remain selectable. GOES defaults to
+every available scan and eight StormScope example channels: C01, C02, C03, C07,
+C08, C09, C10, and C13. Both keep actual observation times and report gaps.
 
-Raw data retain source pixels, coordinates, sentinel codes, and quality metadata.
-Interpolation and cleaning stay in notebook memory. Source files and comparison
-GeoTIFFs are temporary. STAC selections and small run reports go under `results/`;
-large datasets and generated artifacts are ignored by Git.
+Each source, product, native ROI/grid or band, and UTC month has one compressed
+Zarr archive. A repeated fetch merges additional dates into that month. Local
+runs can build separate monthly archives with two writers; HF writing uses one
+Earth2Studio async coordinator and verifies remote arrays before completion.
+Raw values and product metadata are preserved. Cleaning,
+interpolation, calibration decoding, and display reprojection remain session-only
+operations. Local archives use Earth2Studio's `ZarrBackend`; HF archives use
+`AsyncZarrBackend` through obstore. Both can be reopened with the project's
+Earth2Studio-compatible monthly source adapter.
+
+## Use notebooks or scripts
+
+Open the paired notebooks in Jupyter or VS Code and run **Find** before **Fetch**.
+The Python sources also accept argparse options for batch use:
+
+```bash
+python notebooks/01_mrms.py --operation inspect --start 2023-01-01 --end 2023-02-01
+python notebooks/01_mrms.py --operation fetch --start 2023-01-01 --end 2023-02-01 \
+  --product precipitation-rate composite-reflectivity \
+  --destination /mnt/p/ecore_eo_datasets --workers 8 --monthly-writers 2
+python notebooks/02_goes.py --operation fetch --start 2025-09-01 --end 2025-10-01 \
+  --bands 1 2 3 7 8 9 10 13 --destination /mnt/p/ecore_eo_datasets
+python notebooks/02_goes.py --operation estimate --output results/study-goes-estimate
+python scripts/run_mrms_staged.py --destination /mnt/p/ecore_eo_datasets
+```
+
+The default task pool is half the detected CPU count. Decoding can be bounded
+separately. See [notebook usage and outputs](docs/notebooks.md) and the
+[developer guide](docs/developer_guide.md) for more examples.
 
 ## Colab
 
-Open [MRMS in Colab](https://colab.research.google.com/github/avega17/E-CORE_EO_Radar_GFMs/blob/main/notebooks/01_mrms.ipynb),
-[GOES in Colab](https://colab.research.google.com/github/avega17/E-CORE_EO_Radar_GFMs/blob/main/notebooks/02_goes.ipynb), or [the viewer in Colab](https://colab.research.google.com/github/avega17/E-CORE_EO_Radar_GFMs/blob/main/notebooks/03_view_datasets.ipynb)
-after the notebook files have been pushed. The setup cell detects Colab, clones
-this repository if needed, and installs dependencies. Set `REVISION` to the
-pushed branch or commit being tested. The cell prints the resolved commit.
-Use session environment variables for storage credentials; never save tokens in
-notebook cells. Automated links and GitHub Actions are later work.
+[Open MRMS in Colab](https://colab.research.google.com/github/avega17/E-CORE_EO_Radar_GFMs/blob/main/notebooks/01_mrms.ipynb),
+[GOES in Colab](https://colab.research.google.com/github/avega17/E-CORE_EO_Radar_GFMs/blob/main/notebooks/02_goes.ipynb), or
+[the dataset explorer in Colab](https://colab.research.google.com/github/avega17/E-CORE_EO_Radar_GFMs/blob/main/notebooks/03_03_explore_datasets.ipynb)
+after those files are pushed. Setup detects Colab, clones the chosen revision,
+and installs the notebook dependencies. Never store credentials in a notebook.
 
-## Development and evidence
+## Project notes
 
-- [Notebook usage and expected outputs](docs/notebooks.md)
-- [HF and local storage layout](docs/storage.md)
-- [Mentor code review](docs/mentor_code_review.md)
-- [Six-month sample and progress](docs/long_sample.md)
-- [Developer guide and script commands](docs/developer_guide.md)
-- [Current handoff status](docs/status.md)
 - [Development plan](docs/development_plan.md)
-- [Validation and measurements](docs/validation.md)
-- [Why raw data lives in Zarr](docs/raw_data_rationale.md)
-- [Earth2-Studio data source review](docs/earth2studio_review.md)
-- [Shared agent guidelines](AGENTS.md)
-- [Supplied reference list](docs/agent_dev_references)
-- [Original mentor scripts](PR_rain_512_crop/)
+- [Storage layout and HF access](docs/storage.md)
+- [Earth2Studio source and IO review](docs/earth2studio_review.md)
+- [Notebook functions and outputs](docs/notebooks.md)
+- [Developer guide](docs/developer_guide.md)
+- [Validation evidence](docs/validation.md)
+- [Current implementation status](docs/status.md)
+- [Study-period estimate and fetch jobs](docs/study_jobs.md)
+- [Completed GOES study-period estimate](docs/goes_study_estimate.md)
+- [Shared agent instructions](AGENTS.md)
 
-Reusable Python functions live under `src/ecore_weather/`. They can also be called
-directly from scripts, without widgets. For example:
-
-```python
-from ecore_weather import mrms, catalog, storage
-selection = mrms.discover('2025-09-01', '2025-09-01T01:00:00')
-catalog.save_selection(selection, 'results/mrms-example')
-report = storage.fetch(selection)  # configured HF bucket; destination='data' for local
-```
-
-After editing notebook sources:
-
-```bash
-jupytext --sync notebooks/*.py
-python -m compileall -q src notebooks
-pytest -q
-```
-
-Keep notebook outputs cleared before committing.
+Reusable modules are in `src/ecore_weather/`. STAC selections and monthly
+completion manifests are the portable records. `results/archive_index.duckdb`
+is a local, rebuildable search and run index; it is not required to open an archive.

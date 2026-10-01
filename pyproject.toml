@@ -15,8 +15,8 @@ notebooks = [
   "eccodes", "cfgrib", "rasterio", "rioxarray", "pyproj", "h5py",
   "h5netcdf", "netCDF4", "cartopy>=0.24,<0.26", "matplotlib", "requests", "boto3", "s3fs==2026.7.0",
   "zarr==3.3.0", "pystac>=1.12,<2", "jupytext", "ipywidgets", "ipyleaflet>=0.19,<0.21", "tqdm", "pillow", "ipykernel",
-  "psutil", "python-dotenv", "obstore==0.11.1", "virtualizarr==2.7.3",
-  "kerchunk==0.2.10", "huggingface_hub==1.30.0",
+  "psutil", "python-dotenv", "duckdb>=1.4,<2", "obstore==0.11.1", "virtualizarr==2.7.3",
+  "kerchunk==0.2.10", "huggingface_hub==1.30.0", "earth2studio==0.18.0", "loguru",
 ]
 test = ["pytest", "nbclient"]
 
@@ -28,4 +28,3 @@ testpaths = ["tests"]
 
 [tool.jupytext]
 formats = "ipynb,py:percent"
-

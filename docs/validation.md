@@ -204,3 +204,19 @@ Source references: [NOAA MRMS](https://registry.opendata.aws/noaa-mrms-pds/),
 [VirtualiZarr usage](https://virtualizarr.readthedocs.io/en/stable/how_to/usage.html).
 The broader [reference list](agent_dev_references) remains available for later
 mirror, storage, and model experiments.
+
+## Earth2Studio monthly writer and study-job smoke checks (September 29, 2026)
+
+The newer writer is separate from the earlier benchmark results above. In the
+updated `ecore-weather` Conda environment, source-to-monthly-Zarr read-back
+matched a live 2021 MRMS native crop and bitmap and a live GOES-16 C13 packed
+crop and DQF. Both fetch notebooks ran their disposable smoke cells; the shared
+viewer rendered monthly MRMS and GOES samples and the local DuckDB index rebuilt
+from their completion manifests. A 20-minute, eight-product MRMS interval took
+26.3 s with two product-month writer processes and 29.1 s with one process.
+These are functional checks, not statistically reliable speed estimates.
+Successful temporary artifacts were deleted. The HF S3 gateway passed a
+27-byte write/read/delete check. A synthetic Earth2Studio monthly ZIP passed HF S3 upload,
+read-back, completion-marker, and reuse checks; its remote test objects were
+removed. The full study-period estimate and MRMS archive fetch have not run; see
+[study jobs](study_jobs.md) and [current status](status.md).

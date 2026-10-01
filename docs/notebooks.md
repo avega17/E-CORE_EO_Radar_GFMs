@@ -1,147 +1,106 @@
-# Notebook usage and expected outputs
+# Notebook usage and expected results
 
-The two fetching notebooks use the same functions as their command-line interface. In Jupyter,
-run the setup cells, edit the controls, and click **Choose data** before fetching.
-Creating controls does not transfer data. After changing dates, region, product,
-or bands, choose data again to replace the selection used by subsequent actions.
+The `.py` percent-format files in `notebooks/` are the source of truth. Their
+`.ipynb` partners are synchronized with Jupytext. Reusable operations live in
+`src/ecore_weather/`, so notebook buttons and argparse commands use the same
+selection, fetch, archive, and visualization functions.
 
-The examples cover September 1–December 1, 2022 and 2025, in UTC with the ending
-date excluded. The region starts at the mentor's Puerto Rico window. GOES-East
-selects GOES-16 for 2022 and GOES-19 for 2025. An automatic request spanning their
-[April 7, 2025 transition](https://www.ospo.noaa.gov/data/messages/2025/04/MSG_20250407_1510.html) must be split or use an explicit satellite.
+| Notebook | What it does | Expected result |
+| --- | --- | --- |
+| [01 MRMS](../notebooks/01_mrms.ipynb) | Finds CARIB products, records STAC selections, saves raw ROI samples into monthly archives, and examines coverage and sentinel values. | A product/month archive report, per-slot fetch outcomes, patch statistics, and raw/session-processing figures. |
+| [02 GOES](../notebooks/02_goes.ipynb) | Finds full-disk scans and selected bands, records STAC, stores native-resolution subsets, and compares reads or builds sample references. | Per-band monthly archive reports, scan coverage, quality diagnostics, and image previews. |
+| [Explore datasets](../notebooks/03_03_explore_datasets.ipynb) | Searches monthly archives, restores one month from an HF yearly backup when requested, and previews single samples or sequences. | A time-filtered list, interactive map, optional animations/PNG export, and a storage-size explorer. |
 
-## Common controls
+## Shared defaults
 
-Choose dates, geographic bounds, product, download workers, storage destination,
-and a folder for small run files. GOES also offers satellite and bands; C08/C13
-are the examples. **Tasks** defaults to half the available CPU count, at least one. It bounds simultaneous file work, including download and saving. **Readers** selects separate Python reader processes (0 uses threads), capped by Tasks. Hover either control for help. HF publishing remains separately coordinated.
-CPU decoding is bounded separately. Independent reader processes can improve
-HDF5 access; zero uses threads. Choose directory or ZIP Zarr and an optional fast
-local scratch folder. More workers do not guarantee faster reads.
+Date ranges are UTC and exclude the end. MRMS defaults to precipitation rate,
+composite reflectivity, and low-level azimuthal shear at ten-minute slots, plus
+native hourly multisensor Pass2 QPE. Other products remain selectable. For each
+slot it selects the newest observation at or before the slot within five
+minutes, never reusing a file. GOES defaults to all available scans and
+StormScope example channels C01, C02, C03, C07, C08, C09, C10, and C13. Actual
+source timestamps and gaps are shown; no image is synthesized for a missing scan.
 
-A collapsed **Product and variable guide** sits below the controls. Open it to
-see each available product with its units and missing-value codes (MRMS), or the
-full-disk imagery products and all sixteen ABI bands (GOES). It is reference
-text only; it changes nothing until you choose data again.
+Set the product, dates, region, destination, and task/reader concurrency in the
+widgets. The **Find** button only discovers objects and saves compact STAC
+metadata. The **Fetch** button reads and writes data. `hf` uses the configured HF
+bucket; enter a local path to select local storage. Keep NOAA scratch on a disk
+with adequate free space. Local runs may use two writers for separate monthly
+archives; remote publishing uses one coordinator.
 
-**Save to** defaults to the configured HF bucket. Enter a local directory to save
-locally. Fetching saves unchanged native subsets as compressed Zarr. It retains
-source metadata, timestamps, missing-value codes, and GOES packed values and quality
-flags. Completed matching subsets are checked and reused. Failed files appear in
-the report; they are never replaced by zero rain.
+Hover over each worker control for its purpose. Download tasks control concurrent
+source files; reader processes separate HDF5 reads from the kernel when needed;
+monthly writers build independent local monthly stores. Bounds prevent multiple
+workers from writing the same month.
 
-Select an image index after fetching to display imagery and quality maps. The
-**Save displayed figures** checkbox writes PNGs to the figure folder. It does not
-save another processed raster. Processing choices only change the displayed data
-in memory. Changing the figure folder alone does not save anything.
+## Data and displays
 
-## MRMS radar
+Each local month is stored as a compressed Zarr v3 ZIP. HF months are compressed
+Zarr v3 object stores written through Earth2Studio's async backend. Their
+product/region/month grouping is stable across requested date windows, and a
+completion marker points to the verified remote version. Repeated fetches merge
+only missing source records.
+The local path streams source observations into a temporary monthly build and
+removes that build after read-back validation, without retaining source-file
+duplicates. The new monthly store follows
+Earth2Studio's named-array and coordinate conventions and can be opened through
+the project's `MonthlyZarrSource`. Older single-observation folders are outside
+the acceptance checks; migrating them is optional.
 
-Hourly QPE uses one source observation per nominal hour. The default searches up
-to five minutes earlier, so 16:58 can fill 17:00 while retaining 16:58 as the source
-time and recording a −120-second offset. Exact matching is available. Nearest
-matching can use either side of the hour; positive offsets must not be used as
-already-available observations in forecasting input windows. No values are averaged.
+The archived measurements remain raw. The radar and GOES display operations may
+apply quality masks, decode calibration, interpolate, reproject for a map, or
+hide zero rain to improve the view; none of these changes is saved in the raw
+archive. GOES packed counts should not be interpreted as temperatures until
+scale and offset are applied. Radar accumulation products remain accumulations.
 
-Decoding off-hour GRIB files makes the ecCodes library print a "Truncating time"
-notice: the file's HHMM time key drops non-zero seconds, and the library reports
-this once per file. It is benign — the pipeline takes observation times from the
-filenames, not that key, and every saved subset is verified by fingerprint — so
-the notice is suppressed during metadata reads to keep long fetches readable.
+Both fetch notebooks show preview plots inline. Check **Save displayed figures**
+to write PNGs. In notebook 03, choose MRMS or GOES first, enter a local archive
+path or HF bucket path, filter by date/time, then select an observation. The
+single-sample tab uses a pan/zoom map; other tabs prepare a sequence for one day
+or a multi-day period. Sequences are preloaded for the selected, bounded region
+rather than streaming tiles.
 
-Inspect Puerto Rico, Mona Passage, Virgin Islands, and offshore patches. Tables
-show valid measurements, valid zero, documented missing values, no coverage,
-bitmap gaps, and valid-only descriptive statistics. Empty patches remain empty.
-Missing source hours are listed separately from missing pixels. The coverage chart
-shows changes over time. A centered 512 × 512 view is optional.
+The HF yearly MRMS ZIPs are backup containers. In notebook 03, open **HF yearly
+backup**, list verified packages, inspect a product/year, and choose **Prepare
+month**. Byte-range reads restore only that monthly Zarr ZIP to the local cache;
+the viewer checks its SHA-256 and completion marker before searching it. Annual
+ZIPs are not directly openable Zarr stores. Directly readable remote monthly
+Zarr stores can still be searched. The **Storage explorer** nests a summary,
+archive details, and size comparison under product, year, and month selectors.
+It compares stored regional Zarr bytes with listed NOAA source-object bytes and
+reports the percentage only for rows with known original sizes. NOAA objects may
+already be compressed, and their full-file sizes do not represent the ROI crop.
+The size percentage is the ratio of total stored archive bytes to total complete
+listed source-object bytes, not a compression ratio or a mean of month-by-month
+percentages. An archive with any unlisted source size is excluded from that
+comparison and shown in the coverage figure. The explorer opens each monthly
+archive once when preparing a sequence, then reads the requested frames from
+that store.
+A live fetch may hold the local DuckDB write lock; direct archive paths bypass
+it and broader searches fall back to completion manifests. Restart the notebook
+kernel after changing imported viewer modules. The setup cell puts this checkout's
+`src/` directory first on `sys.path`, and prints the loaded viewer module path.
+If the search reports matches but a visualization still requests a new search,
+restart the kernel and rerun the setup and widget cells so callbacks no longer
+use an older imported viewer module.
 
-Compare the mentor's interpolation and cleaning with masking documented missing
-values before interpolation. Both leave stored raw data unchanged. The exact
-benchmark reader includes a one-pixel margin; a previously stored crop cannot
-provide neighbours beyond its edges.
+## Script use
 
-**Validate** checks every selected file through a raw Zarr round trip and compares
-mentor calculations in isolated batches. **Benchmark** runs matched source files
-through sequential and concurrent methods. Parallel validation timings are not
-speed benchmark results. MRMS gzip downloads still require complete source files.
-
-## GOES imagery
-
-The product control offers full-disk imagery only: the CONUS sector (roughly
-20°N–50°N, 125°W–65°W) does not cover Puerto Rico, and this project works in the
-Caribbean. CONUS products remain available from the command line for advanced use.
-
-**Scans/hour** controls how many images are kept from each UTC hour. The
-default, 1, keeps the scan nearest the top of the hour and downloads far less
-than the full inventory; raise it for denser sampling, keeping the scans nearest
-to evenly spaced marks. Validation and the long-run scripts request every
-available scan explicitly, so their measurements are unaffected.
-
-The ordinary reader selects bands and a geographic window before loading array
-chunks. Raw packed pixels and decoded physical values are different views; decoding
-uses the preserved calibration. Quality masking and interpolation are optional.
-
-Validation discovers the whole period, then compares six actual scans: nearest to
-midnight and noon on the first, middle, and last included days. For these examples
-those dates are September 1, October 16, and November 30. Partial-day requests
-use available scans; single-band products retain each requested band. Full-file, ranged, and
-virtual reads must match every selected array and coordinate. Reference-building
-cost is reported separately. Virtual groups keep incompatible encodings apart.
-
-**Build references** saves a small bundle containing Kerchunk references to NOAA's
-original objects. It can be reopened with `goes.open_virtual` or, for a compatible
-group, `goes.open_virtual_group`. Source objects must remain accessible. The bundle
-contains references and inline small metadata, not duplicated satellite imagery.
-
-## Files to expect
-
-| Action | Retained outputs |
-| --- | --- |
-| Choose / inspect | `collection.json` and `items.json` in the run folder; the latter includes the executable request and STAC Items |
-| Fetch | One canonical raw Zarr subset per source object, completion markers, and a run report |
-| Display | Inline figures; PNGs only when saving is requested |
-| Benchmark | Small timing/equality reports; source files and comparison rasters are temporary |
-| Build GOES references | One `index.json` bundle, rather than one JSON per source file |
-| Validate | One `validation.json`; temporary Zarr, sources, references, and detailed comparisons are removed |
-
-Use a different run folder to preserve a selection before choosing another one.
-Ordinary fetched research data are never deleted by test cleanup. See the
-[developer guide](developer_guide.md) for script commands and testing.
-
-## Dataset viewer (03)
-
-Run the setup cells, enter an archive prefix or individual `raw.zarr` /
-`raw.zarr.zip` path, and click **Find**. For a local archive a **Month** list
-quickly shows which months have stored observations for the selected source
-before you search (folder names only, computed once per source); picking one
-sets Start and End to that month, and editing a date clears it. A progress bar
-and the status line show the search is running, then report observations, days
-covered, datasets, and elapsed time. The across-days view selects 1–24 images
-per day. The search
-is cached for the session, so repeating an identical search is instant. A period
-split across subset folders appears as one dataset entry. Select a dataset; for
-GOES the **Band** is then chosen from a row of buttons that lists only the bands
-actually stored, and switching bands re-reads the same observations without a
-new search. A listing shows at most 200 subsets; use a product/date folder for a
-large archive. A fetch report JSON is also accepted. Local and
-`hf://buckets/namespace/bucket/prefix` locations use the same controls.
-
-Display quality masking and **Hide zero values** change only the figure. Zero
-rain is valid. Packed GOES values are decoded in memory and plotted at their
-native geographic coordinates; this is not a persisted reprojection. After
-**Show map** or preparing a **Day**/**Multi-day** animation, an export row
-appears: the single image saves a PNG, and animations save a self-contained
-`.html`, a `.gif`, or an `.mp4` (`.mp4` needs an ffmpeg binary). From a terminal:
+Run the source as a script with the same request functions and CLI options:
 
 ```bash
-python notebooks/03_view_datasets.py /path/to/raw.zarr.zip --hide-zero --output figures/rain.png
+python notebooks/01_mrms.py --operation inspect --start 2024-09-15 --end 2024-09-22
+python notebooks/01_mrms.py --operation fetch --start 2024-09-15 --end 2024-09-22 \
+  --destination /mnt/p/ecore_eo_datasets --save-figures figures/mrms
+python notebooks/02_goes.py --operation inspect --start 2025-09-01 --end 2025-10-01
 ```
 
-Natural Earth land/coastlines are downloaded once to Cartopy's cache, then reusable
-offline. On an offline cluster, populate that cache in advance. HF ZIP views fetch
-one cropped ZIP into temporary scratch; directory stores open through the HF
-filesystem. No local tile server is required for these small scientific subsets.
-The original MRMS notebook also shows a rain map with this geographic context.
+For MRMS, `--product` accepts `precipitation-rate`, `composite-reflectivity`,
+`base-reflectivity`, `radar-only-qpe-1h`, `low-level-azimuthal-shear`,
+`mid-level-azimuthal-shear`, `multisensor-qpe-pass1`, and
+`multisensor-qpe-pass2`. These readable names resolve to NOAA's exact product
+keys in selections and archive metadata.
 
-References: [ipywidgets tooltip migration](https://ipywidgets.readthedocs.io/en/latest/user_migration_guides.html#tooltips)
-and [Cartopy geographic features](https://cartopy.readthedocs.io/stable/matplotlib/feature_interface.html).
+Colab setup only detects Colab, clones the repository at `ECORE_REVISION` (or
+`main`), and installs `.[notebooks]`. The selected commit is printed. Package
+changes must be pushed at that revision before clone-based Colab testing.

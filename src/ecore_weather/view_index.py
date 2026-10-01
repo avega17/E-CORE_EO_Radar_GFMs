@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .common import iso, utc
-from .storage import open_raw
+from .storage import open_raw, valid_raw_name
 
 
 def path_day(path):
@@ -31,8 +31,18 @@ def in_period(path, start, end):
 
 def observation(folder, marker):
     name = marker.get('raw_path','raw.zarr')
-    if name not in ('raw.zarr','raw.zarr.zip'):
+    if not valid_raw_name(name):
         raise ValueError('Invalid raw container in completion marker.')
+    if marker.get('assets'):
+        band = marker.get('band')
+        dataset = str(folder).split('/roi-')[0]
+        return [{'path':str(folder)+'/'+name,'time':iso(asset['time']),
+            'source':marker.get('source'),'band':band,'product':marker.get('product'),
+            'dataset':dataset,'asset_id':asset.get('asset_id'),
+            'source_url':asset.get('source_url',''),'etag':asset.get('etag',''),
+            'slot_time':asset.get('slot_time') or None,
+            'offset_seconds':asset.get('offset_seconds'),
+            'subset_id':str(folder).split('/roi-')[-1].split('/')[0]} for asset in marker['assets']]
     source_url = marker.get('source_url','')
     source = 'goes' if 'noaa-goes' in source_url or '/goes/' in folder else 'mrms' if 'noaa-mrms' in source_url or '/mrms/' in folder else None
     stamp = marker.get('time')
@@ -81,7 +91,7 @@ def months_available(location, source=None):
     for directory, folders, _ in os.walk(root):
         keep = []
         for f in folders:
-            if f == 'raw.zarr':
+            if f.endswith('.zarr'):
                 continue
             if year.fullmatch(f):
                 # Read this year's month subfolders, then do not descend into it.
@@ -101,15 +111,44 @@ def inventory(location, source=None, start=None, end=None, band=None, limit=5000
     start=utc(start) if start else None;end=utc(end) if end else None
     if start and end and start>=end: raise ValueError('End time must follow start time; end is excluded.')
     location=str(location).rstrip('/'); records=[]
+    if not location.startswith('hf://') and not location.endswith(('.zarr', '.zarr.zip')):
+        try:
+            from .index import search
+            indexed = search(location, source, start, end, band)
+            if indexed:
+                for row in indexed[:limit]:
+                    folder = row['path'].rsplit('/', 1)[0]
+                    group = re.sub(r'/(?:19|20)\d{2}/\d{2}$', '', folder)
+                    records.append({**row, 'dataset': group})
+                return records
+        except Exception:  # Read the portable manifests when the index is busy.
+            pass
     def add(folder,marker):
-        row=observation(folder,marker); stamp=utc(row['time'])
-        if (not source or row['source']==source) and (not start or stamp>=start) and (not end or stamp<end) and (band is None or row['band'] in (None,band)):
-            records.append(row)
+        found=observation(folder,marker)
+        if isinstance(found,dict): found=[found]
+        for row in found:
+            stamp=utc(row['time'])
+            if (not source or row['source']==source) and (not start or stamp>=start) and (not end or stamp<end) and (band is None or row['band'] in (None,band)):
+                records.append(row)
     if location.endswith(('.zarr','.zarr.zip')):
         with open_raw(location) as ds:
             actual='mrms' if 'measurement' in ds else 'goes'
             marker={'raw_path':location.rsplit('/',1)[-1],'source_url':ds.attrs.get('source_url',''),
                     'time':ds.attrs.get('observation_time',ds.attrs.get('time_coverage_start'))}
+            if 'time' in ds.coords and ds.time.ndim == 1:
+                band_match = re.search(r'/C(\d{2})/', location)
+                for i, stamp in enumerate(ds.time.values):
+                    time_text = iso(stamp.astype('datetime64[us]').astype(object))
+                    source_url = str(ds.source_url.values[i]) if 'source_url' in ds.coords else ''
+                    records.append({'path':location,'time':time_text,'source':actual,
+                        'band':int(band_match[1]) if band_match else None,
+                        'dataset':location.rsplit('/',3)[0],
+                        'asset_id':str(ds.source_asset_id.values[i]) if 'source_asset_id' in ds.coords else None,
+                        'source_url':source_url,
+                        'slot_time':str(ds.request_slot_time.values[i]) if 'request_slot_time' in ds.coords and ds.request_slot_time.values[i] else None})
+                return [r for r in records if (not source or r['source']==source)
+                    and (not start or utc(r['time'])>=utc(start)) and (not end or utc(r['time'])<utc(end))
+                    and (band is None or r['band'] in (None,band))]
         add(location.rsplit('/',1)[0],marker)
         return records
     if location.startswith('hf://buckets/'):
@@ -120,11 +159,17 @@ def inventory(location, source=None, start=None, end=None, band=None, limit=5000
         pending=[prefix]; markers=[]
         while pending:
             current=pending.pop()
+            # Annual ZIP packages are backup containers, not Zarr stores.
+            # The viewer restores a chosen monthly member explicitly.
+            if '/yearly-v1/' in '/'+current.strip('/')+'/':
+                continue
             if not in_period('/'+current,start,end):continue
             recursive=path_day('/'+current) is not None
             for obj in pub.api.list_bucket_tree(pub.bucket,prefix=current,recursive=recursive):
                 if not hasattr(obj,'size'):
-                    if not recursive and not obj.path.endswith('raw.zarr'): pending.append(obj.path)
+                    if (not recursive and not obj.path.endswith('.zarr')
+                            and '/yearly-v1/' not in '/'+obj.path.strip('/')+'/'):
+                        pending.append(obj.path)
                 elif obj.path.endswith('/complete.json'):
                     markers.append(obj)
         # Bounded batches avoid one request per Zarr chunk. No token goes in a URL.
@@ -147,7 +192,7 @@ def inventory(location, source=None, start=None, end=None, band=None, limit=5000
             return sorted(records,key=lambda r:r['time'])
         if not root.is_dir():raise FileNotFoundError(str(root))
         for directory,folders,files in os.walk(root):
-            folders[:]=sorted(f for f in folders if f!='raw.zarr' and in_period(str(Path(directory)/f),start,end)
+            folders[:]=sorted(f for f in folders if not f.endswith('.zarr') and in_period(str(Path(directory)/f),start,end)
                               and not (source and f in ('mrms','goes') and f!=source))
             if not in_period(directory,start,end):folders[:]=[];continue
             if 'complete.json' in files:

@@ -1,9 +1,9 @@
 # %% [markdown]
 # # GOES: raw subsets, quality flags, and virtual references
-# Start with full-disk C08/C13 imagery. The example periods are September 1–
-# December 1 in 2022 and 2025. Automatic GOES-East selection uses GOES-16 for
-# the 2022 period and GOES-19 for the 2025 period. You can select a satellite
-# explicitly. Raw storage keeps packed integers, coordinates, calibration, and
+# Start with full-disk StormScope bands C01, C02, C03, C07, C08, C09, C10, and C13.
+# Files are selected one band at a time from CMIPF by default. Choose a UTC
+# period and satellite below; GOES-East uses GOES-16 before the April 2025
+# operational handoff and GOES-19 afterwards. Raw storage keeps packed integers, coordinates, calibration, and
 # quality flags. Decoding and interpolation happen only in memory.
 
 # %%
@@ -36,6 +36,8 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
     REVISION = os.getenv("ECORE_REVISION", "main")
     IN_COLAB = "google.colab" in sys.modules or bool(os.getenv("COLAB_RELEASE_TAG"))
     if IN_COLAB:
+        from google.colab import output
+        output.enable_custom_widget_manager()
         root = Path("/content/E-CORE_EO_Radar_GFMs")
         if not root.exists():
             subprocess.run(["git", "clone", REPOSITORY, str(root)], check=True)
@@ -60,7 +62,7 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
     from IPython.display import display
     if get_ipython() is not None:
         get_ipython().run_line_magic("matplotlib", "inline")
-    from ecore_weather import benchmark, catalog, diagnostics, storage, ui, validation, visualization
+    from ecore_weather import benchmark, catalog, diagnostics, storage, ui, validation, visualization, view_frames
     from ecore_weather.common import PATCHES
     SMOKE = os.getenv("ECORE_NOTEBOOK_SMOKE") == "1"
 
@@ -76,9 +78,8 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 #
 # The default durable destination is the HF bucket configured in `.env` or session
 # environment variables. Enter a local path to choose local storage explicitly.
-# STAC describes the selection using two JSON files in the run folder, rather
-# than creating one directory per observation. The current selection replaces
-# those two files; choose another run folder when you want to keep another selection.
+# STAC describes the full selection in a small pair of JSON files. Archived
+# samples are grouped by satellite, native band grid, ROI, and month.
 #
 # The product list offers full-disk imagery only. The CONUS sector (roughly
 # 20°N–50°N, 125°W–65°W) does not cover Puerto Rico, and this project works in
@@ -87,12 +88,11 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # and variable guide" below the controls describes both full-disk products and
 # all sixteen ABI bands.
 #
-# **Scans/hour** controls how many images are kept from each UTC hour. The
-# default, 1, keeps the scan nearest the top of the hour and downloads far less
-# than the full inventory (full disk has up to six scans an hour). Raise it for
-# denser sampling; the scans nearest to evenly spaced marks are kept. The
-# validation runs and the long-run scripts request every available scan
-# explicitly, so their measurements are unaffected by this control.
+# **Scan frequency** keeps every available scan by default (ordinarily about
+# one every ten minutes). Choose fewer scans only to shorten an exploratory run.
+# For a long metadata-only size and time estimate, use this notebook as a script
+# with `--operation estimate`; it inventories available scans and reads only a
+# bounded set of native-grid crop samples.
 
 # %%
 if __name__ != "__mp_main__":  # Spawned readers must not construct notebook widgets.
@@ -115,22 +115,22 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # The run report keeps per-file outcomes and timings. Publishing includes the
 # remote read-back check and is measured separately from source reads and writing.
 #
-# Each scan is fetched once and kept as one canonical Zarr copy. The ordinary
-# reader transfers only the requested bands and region, so there is no need to
-# download whole full-disk files to study Puerto Rico. The reference bundle in
-# the last section points back to NOAA's files instead of copying them; the same
-# pointer idea is what large projects use to make whole archives browsable.
-# See docs/raw_data_rationale.md.
+# Each requested band file is read for the chosen native-grid window. One
+# compressed monthly Zarr archive per band avoids duplicates when later requests
+# overlap earlier dates. GOES reads only requested file sections. The optional
+# virtual bundle points back to NOAA files and remains dependent on their access.
 
 # %%
 if __name__ != "__mp_main__":  # Spawned readers must not construct notebook widgets.
     def fetch_data():
-        report = storage.fetch(chosen["value"], destination=controls["destination"].value,
-                               workers=controls["workers"].value, report_dir=controls["output"].value,
-                               layout=controls["layout"].value, container=controls["container"].value, read_processes=controls["read_processes"].value,
-                               scratch=controls["scratch"].value or None,
-                               inspect=lambda ds: diagnostics.describe(ds).to_dict("records"))
-        successful = [r for r in report["records"] if r["status"] in ("saved", "reused")]
+        from ecore_weather import monthly
+        with ui.FetchProgress(len(chosen["value"].assets), "GOES") as progress:
+            report = monthly.fetch(chosen["value"], destination=controls["destination"].value,
+                workers=controls["workers"].value, report_dir=controls["output"].value,
+                read_processes=controls["read_processes"].value,
+                monthly_writers=controls["monthly_writers"].value,
+                scratch=controls["scratch"].value or None, progress=progress)
+        successful = [r for r in report["records"] if r["status"] in ("archived", "reused")]
         controls["image_index"].max = max(0, len(successful)-1)
         display(dict(Counter(r["status"] for r in report["records"])))
         display(pd.DataFrame([r for r in report["records"] if r["status"] == "failed"]))
@@ -153,14 +153,15 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
         ("Puerto Rico grid", "reproject"), ("Raw only", None)], value="quality", description="View")
     display(recipe)
     def show_image():
-        rows = [r for r in fetched["value"]["records"] if r["status"] in ("saved", "reused")]
+        rows = [r for r in fetched["value"]["records"] if r["status"] in ("archived", "reused")]
         row = rows[controls["image_index"].value]
-        with storage.open_raw(row["url"]) as raw:
+        with view_frames.open_observation(row) as raw:
             before = storage.fingerprint(raw)
-            print("Source observation:", row["time"])
+            variable = f"CMI_C{int(row['band']):02d}" if row.get("band") else "CMI"
+            print("Source observation:", row["time"], "band:", row.get("band"))
             display(diagnostics.describe(raw))
             files = visualization.show_or_save(raw, controls["figure_dir"].value if controls["save_figures"].value else None,
-                                               recipe=recipe.value)
+                                               recipe=recipe.value, variable=variable)
             assert storage.fingerprint(raw) == before
             if files:
                 print("Saved figures:", files)
@@ -223,7 +224,7 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
             controls["workers"].value = 1
             catalog.save_selection(chosen["value"], controls["output"].value)
             fetched["value"] = fetch_data()
-            assert all(r["status"] == "saved" for r in fetched["value"]["records"])
+            assert all(r["status"] in ("archived", "reused") for r in fetched["value"]["records"])
             assert show_image()
 
 # %% [markdown]

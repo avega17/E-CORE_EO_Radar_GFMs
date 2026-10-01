@@ -7,7 +7,7 @@ mentor's original download scripts to a raw-lossless pipeline built around Zarr,
 and why that choice also serves us well on shared drives and HPC systems. It is
 the narrative companion to the measured evidence in
 [validation](validation.md), [storage](storage.md), and
-[long_sample](long_sample.md), and to the library comparison in
+[dataset_fetch_run](dataset_fetch_run.md), and to the library comparison in
 [the Earth2-Studio review](earth2studio_review.md).
 
 ## Why we changed the fetching approach

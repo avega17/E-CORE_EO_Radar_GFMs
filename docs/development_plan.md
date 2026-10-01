@@ -1,110 +1,102 @@
-# Two notebooks to test and improve NOAA fetching
+# NOAA monthly archives with Earth2Studio
 
-Implementation scope: September 2026. The first deliverable is a practical research
-comparison, with evidence in [validation.md](validation.md).
+This sprint refactors the research fetchers to use Earth2Studio-compatible
+sources, preserve native NOAA observations, and create compressed monthly Zarr
+archives. The wrappers reuse the project’s CARIB MRMS and GOES readers because
+the stock Earth2Studio sources do not provide the needed Caribbean region and
+variable selection. Training and StormScope inference remain outside this work.
+The study-period commands, checkpoints, and current evidence are in
+[study jobs](study_jobs.md) and [status](status.md).
 
-## H2 2022 extension and HF write review
+## Data selection
 
-The three-month checks are complete. Review the mentor code and HF bucket access
-patterns, coordinate publication independently of NOAA reads, test both HF and local
-writes, and fetch July 1–January 1, 2022–2023 locally. Keep all available MRMS hours
-and GOES-16 scans with eight selected infrared bands. Use fast scratch and the
-mounted Windows P: DAS for long-term storage. Record actual elapsed time, transfer,
-retained bytes and failures; no extrapolated speed claim. Keep one raw representation,
-with readable product/date paths and optional Zarr ZIP containers. See
-[review](mentor_code_review.md), [storage](storage.md), and [long sample](long_sample.md).
+- MRMS study defaults to four products: precipitation rate, composite
+  reflectivity, low-level azimuthal shear at ten-minute request slots, and
+  multisensor Pass2 QPE at hourly cadence. Other supported products remain
+  selectable. The latest file at or before each slot may be used within five
+  minutes, at most once. Rolling one-hour QPE is still an accumulation.
+  The CARIB S3 shear keys have underscores and a `00.50` suffix; a shear zero
+  is ambiguous without bitmap/coverage context. See the
+  [NOAA product table](https://www.nssl.noaa.gov/projects/mrms/operational/tables.php).
+- GOES defaults to every discovered full-disk scan and eight StormScope example
+  bands (C01, C02, C03, C07, C08, C09, C10, C13). CMIPF selects separate files per
+  band; MCMIPF is available when a scan-wide multiband file is useful. GOES
+  samples retain native grids, packed pixels, quality flags, calibration, and
+  actual scan times.
+- STAC selections persist the files and requested region/times before fetching.
+  NOAA source objects are anonymous. No dates or measurements are synthesized
+  to hide missing observations.
 
-## Completed three-month test extension
+## Storage and resume
 
-The initial weekly comparisons below are complete. The expanded tests use
-September 1–December 1 in **2022 and 2025**, excluding December 1. Test every MRMS
-hourly slot (2,184 per period); discover the entire GOES period and compare six
-representative scans. Use GOES-16 in 2022 and GOES-19 in 2025.
+Each archive covers one source, product, satellite where relevant, native ROI
+and grid/band, and UTC month. Repeated date requests merge new source objects
+into the existing month. Local runs may build two different monthly stores at a
+time; source-read and decode pools have separate limits. HF month mirroring may
+publish two distinct monthly prefixes concurrently, with same-prefix writes
+serialized and a one-writer fallback if throttling occurs. The local writer permits up to 16 source-read tasks per month,
+bounded separately from the decode slots, and writes observations directly to
+Earth2Studio Zarr. It does not
+accumulate per-object staging stores. Temporary monthly builds are removed
+after raw-data read-back validation.
 
-Hourly MRMS matching defaults to an observation at or before the slot, within five
-minutes. Keep actual timestamps and offsets. Share request/pipeline functions
-between interactive widgets and argparse scripts. Default downloads to half the
-CPU count and offer inline images plus optional PNG export.
+Use Earth2Studio's standard `ZarrBackend` for local monthly archives.
+The source arrays retain their native names and dimensions, and the backend
+stores each variable as a named array with explicit coordinates. The project
+`MonthlyZarrSource` reopens these arrays through Earth2Studio's
+`DataSource(time, variable)` interface. Compact auxiliary source provenance is
+stored alongside the Zarr arrays. The default HF writer uses Earth2Studio's
+`AsyncZarrBackend` to write compressed Zarr objects directly through obstore.
+It shards across a bounded number of time slices, verifies the remote arrays,
+then updates the month completion marker. A local monthly ZIP keeps compressed
+chunks together on P:. Migration of older stores is out of scope for this path.
 
-Keep documentation current in `docs/`. Selections use two JSON files; virtual
-references use one bundle. Validation removes its own scratch and retains a compact
-result. Remove successful manual test artifacts after recording their evidence.
-Ordinary fetched research subsets remain durable. See [usage](notebooks.md) and
-[developer commands](developer_guide.md).
+Use the S3 gateway credentials for direct HF bucket access, separately from the
+Hub token used by metadata APIs. A remote month is complete only after the
+backend closes, each array and provenance entry is read back, and the completion
+marker points to the verified version. If the gateway is unavailable or
+throttles requests, stop; an explicit local destination remains available.
+Never silently change the destination or writer. Do not report an HF time
+forecast; record measured remote bytes and elapsed time after each run.
 
-## Original implementation order
+## Index and estimates
 
-1. Run the unchanged mentor hourly downloader for September 18–25, 2022 and
-   September 15–22, 2024, using UTC and excluding the ending date. Report missing
-   clock hours and inspect output geometry, units, values, and missingness. Keep
-   the original scripts. Remove their temporary downloads and rasters.
-2. Build the MRMS notebook: choose dates, product, Puerto Rico region, storage,
-   and concurrency; inspect and save a STAC selection; fetch native pixels;
-   save lossless Zarr; inspect Caribbean patches; compare session-only processing.
-3. Compare identical source files and the mentor's processed output using
-   sequential reads, four workers, and obstore. Report bytes, elapsed time,
-   decoding/processing, writing, and memory. Measure raw Zarr and HF publishing
-   separately. Repeat promising comparisons three times before claiming speed.
-4. Build the GOES notebook with the same sequence. Begin with GOES-16 full-disk
-   C08/C13. Compare full-file, range, and virtual reads on six scans per week:
-   midnight/noon on the first, middle, and last included days. Preserve packed
-   values and quality metadata. Check all selected variables and coordinates.
-5. Check raw round trips, missing-value diagnostics, processing without mutation,
-   failure cleanup, notebook synchronization, and execution. Run a small Colab
-   check against the exact pushed revision when Google authorization is available.
+`results/archive_index.duckdb` is a local, rebuildable discovery and run log.
+One coordinator owns writes. STAC files and each archive's completion manifest
+remain the portable source of truth. Rebuild the index with
+`ecore_weather.index.rebuild(["/local/archive/root"])` after removing the local
+database or moving to a new workstation.
 
-## Keep the setup small
+The selector reports listed source bytes, sampled raw-subset and compressed-Zarr
+size ranges, and approximate local fetch times for week/month/year durations.
+Only observed sample timings support those rough local estimates. HF transfer
+rates are reported only after a completed publish.
 
-- `notebooks/01_mrms.py` and `02_goes.py` are the notebook sources. Jupytext
-  generates their `.ipynb` partners. Explanations use plain language.
-- `src/ecore_weather/` contains reusable readers, storage, STAC, diagnostics,
-  processing, timing, and widgets. Notebook buttons call these same Python functions.
-- `environment.yml` manages local Conda dependencies. The package's `notebooks`
-  extra provides the matching pip dependencies for Colab. No GPU stack is needed.
-- Colab setup detects the runtime, clones a configurable revision, and installs
-  dependencies. Changes under `src/` must be pushed before clone-based testing.
-  README notebook links are ordinary links; automated badges/actions are deferred.
-- HF bucket storage is the default. `HF_BUCKET_NAME` names the bucket;
-  `HF_DATASET_REPO` is a compatibility alias, not a dataset-repository assumption.
-  An explicit local path is supported. Failed uploads never change destinations.
+## Notebook and script use
 
-## Preserve the research data
+`notebooks/01_mrms.py` and `notebooks/02_goes.py` share request and pipeline
+functions with their argparse entry points. Widget controls do not fetch until
+the user presses a button. Both notebooks show fetched imagery and can save PNGs.
+Colab setup detects the runtime, clones the selected revision, and installs the
+notebooks extra; test changed package code there only after pushing that revision.
 
-Save one canonical raw subset per source object and selection. Preserve native
-coordinates, decoded MRMS values and bitmap missingness, packed GOES values,
-calibration, units, and quality flags. Do not interpolate, clean, clip, or replace
-missing values during ingestion. Source containers are temporary scratch.
+## Checks required before the long sample
 
-The mentor's interpolation and cleaning, and a version that masks documented
-missing values first, are separate in-memory views. A centered 512 × 512 crop is
-an optional view. Do not save processed rasters by default.
+1. Match source pixels, coordinates, calibration, quality flags, sentinel values,
+   and missingness before and after the Earth2Studio `ZarrBackend` write. Reopen
+   the result through `MonthlyZarrSource` and compare requested Earth2Studio
+   values and timestamps.
+2. Test ten-minute MRMS assignment, missing slots, Pass2 hourly matching, and the
+   separation of accumulation interval from request frequency.
+3. Run a small direct S3 upload/reopen/read-back check. Then verify bounded HF
+   publication and resume on a representative month; use one publisher.
+4. Compare one and two local monthly writers. Confirm no worker shares a store,
+   memory stays within practical limits, and interrupted staging is cleaned.
+5. Verify DuckDB search and rebuild from manifests. Prioritize the new monthly
+   archive schema; legacy archive migration is not a release gate.
+6. Run focused tests, synchronize the Jupytext pairs, and try both CLI entry
+   points. A live full-period job follows these checks.
 
-Report valid zero, documented missing values, no coverage, bitmap gaps, and
-missing files separately. Statistics use valid observations only; empty patches
-remain empty. Use product definitions rather than masking every negative value.
-
-MRMS gzip still requires full-object reads. GOES references point to NOAA objects
-and require continuing source access. Keep incompatible encodings in separate
-groups. STAC and virtualization are experiments to measure, not automatic speedups.
-
-## Later work
-
-Managed Icechunk storage, external mirror comparisons, H3/DuckDB experiments,
-broader architecture, production ingestion, automation, training, and model
-inference follow the initial measurements. The cited Dynamical CONUS product is
-not a replacement for CARIB data. Use [the supplied references](agent_dev_references)
-when these later experiments begin.
-
-## Final notebook usability and archive checks
-
-- Short widget labels and hover help for Tasks (concurrent files) and Readers
-  (independent decoding processes); maintain the existing product guides.
-- Shared source/ROI paths across date requests, with verified adoption of older
-  local folders and explicit relocation records.
-- Radar coastline/land context and a third, small local/HF dataset viewer with
-  optional PNG output. Tile servers remain outside this initial notebook scope.
-- H1 2023 full available-hour MRMS matched-output comparison; January 2023
-  CMIPF full discovery and representative reads across eight requested bands.
-- Refresh all notebook pairs, test raw preservation/reuse and CLI paths, retain
-  compact measurements, and remove owned successful test data. Colab validation
-  of the exact commit follows publication and Google authentication.
+See the [developer guide](developer_guide.md), [storage guide](storage.md),
+[notebook guide](notebooks.md), [current status](status.md), and
+[Earth2Studio review](earth2studio_review.md) for operational details.

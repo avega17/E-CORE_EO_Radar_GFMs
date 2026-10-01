@@ -2,10 +2,10 @@
 # # Explore radar and satellite imagery over time
 # Choose **MRMS** or **GOES**, a local archive or the configured Hugging Face
 # bucket, and UTC start/end dates and times. The ending instant is excluded.
-# **Find observations** filters the archive first; choose one product/region
-# from the short dataset list. Observation times use a slider rather than a
-# long dropdown. The initial July 2022 day is in our existing archive; change
-# the dates to explore the new 2023 fetches as they complete.
+# **Find observations** reads Earth2Studio monthly archive markers (or the local
+# DuckDB index) and filters them by source and time. Then choose one
+# product/region from the short dataset list. Observation times use a slider
+# rather than a long dropdown. The **Month** list helps choose a stored period.
 #
 # Three tabs show a single image, every available observation within one day,
 # or 1–24 selected images per day across the period. Maps support dragging and
@@ -54,17 +54,31 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
         root = next((p for p in (Path.cwd(), *Path.cwd().parents)
                      if (p / "src/ecore_weather").exists()), Path.cwd())
         os.chdir(root)
+    # This is a src-layout repository. Put this checkout ahead of any older
+    # editable or site-installed copy so a fresh kernel loads the code being
+    # viewed. Restart the kernel after changing src/ modules.
+    source_path = str((root / "src").resolve())
+    if source_path in sys.path:
+        sys.path.remove(source_path)
+    sys.path.insert(0, source_path)
     print("Repository:", root)
     print("Commit:", subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip())
 
 # %% [markdown]
 # ## Choose data, then a view
-# Local example: `/mnt/p/ecore_eo_datasets`. Selecting **Hugging Face** fills in
-# the configured `hf://buckets/.../noaa-subsets` location. You can also enter a
-# narrower product/region folder or an individual raw Zarr path. An existing
-# hf-mount directory works through **Local**, but mounting is not required.
-# Credentials stay in your environment. HF ZIP subsets use temporary local
-# scratch while opening; preparation closes those files after each frame.
+# Local example: `/mnt/p/ecore_eo_datasets`. You can enter a product folder or
+# an individual monthly `raw.zarr.zip` path. The viewer opens the project's
+# Earth2Studio-backed monthly Zarr arrays and reads the selected observation.
+# An existing hf-mount directory also works through **Local**.
+#
+# Selecting **Hugging Face** fills in the configured bucket path. The yearly
+# MRMS ZIP packages there are backups, not directly viewable Zarr stores. Open
+# **HF yearly backup**, list the verified packages, choose a product and year,
+# inspect its months, and click **Prepare month**. The viewer transfers and
+# verifies only that monthly member into the local cache you choose, then finds
+# its observations. The full yearly package is not downloaded. Direct remote
+# monthly Zarr stores, if present, can still be searched. Credentials stay in
+# the environment; no mount or tile server is required.
 #
 # For a local archive, the **Month** list quickly shows which months have stored
 # observations for the selected source before you search (computed once, only for
@@ -74,9 +88,8 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # line show the search is running, then report how many observations, days, and
 # datasets matched and how long it took. One period that happens to be split
 # across subset folders appears as a single dataset entry.
-# The satellite **Band** is chosen after the search, as a row of buttons next to
-# the view controls. Only the bands actually stored in the selected dataset are
-# shown, and switching bands re-reads the same observations without a new search.
+# The satellite **ABI band** dropdown appears after the search. Only stored
+# bands are shown, and switching bands re-reads the selected observation.
 # **Hide zero values** makes valid zero rain transparent in the display.
 # Preparing an animation shows its own progress bar.
 #
@@ -85,15 +98,27 @@ if __name__ != "__mp_main__":  # Spawned readers must not construct notebook wid
 # saves a PNG, and animations save a self-contained `.html` page, a `.gif`, or an
 # `.mp4` (the `.mp4` option needs an ffmpeg binary). Colors keep the same fixed
 # scale as the on-screen view.
+#
+# Open **Storage explorer** to compare completed archive sizes with the listed
+# NOAA source-object bytes. Its nested sections show a summary, archive details,
+# and a size comparison; choose a product, year, and month to narrow the view.
+# The percentage is compressed Zarr bytes divided by the original listed NOAA
+# object bytes for archives with known source sizes. NOAA objects may already be
+# compressed, and these full-object sizes are not the size of the smaller ROI crop.
+# If Find reports observations but a view still says to find observations,
+# restart the kernel and run the setup cell again. The notebook puts this
+# checkout's `src/` directory first on Python's import path; an already running
+# kernel can still hold older imported modules in memory.
 
 # %%
 if __name__ != "__mp_main__":
     from ecore_weather import viewer
+    print("Viewer module:", viewer.__file__)
     panel = viewer.controls()
 
 # %% [markdown]
 # ## Run from a terminal
-# `python notebooks/03_view_datasets.py /path/to/raw.zarr.zip --hide-zero --output figures/rain.png`
+# `python notebooks/03_03_explore_datasets.py /path/to/raw.zarr.zip --hide-zero --output figures/rain.png`
 #
 # The [storage guide](../docs/storage.md) explains paths and remote access.
 # The [Leafmap Zarr example](https://leafmap.org/notebooks/111_zarr/),

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import hashlib
 import os
 import sys
 import time
 import threading
+import zlib
 from collections import OrderedDict
 from bisect import bisect_left, bisect_right
 from datetime import timedelta
@@ -15,32 +17,77 @@ from datetime import timedelta
 import numpy as np
 import xarray as xr
 
-from .common import Asset, PR_BBOX, Selection, Transport, hours, iso, list_objects, s3_client, validate_request, utc
+from .common import (Asset, PR_BBOX, Selection, Transport, hours, time_slots, iso,
+                     list_objects, s3_client, validate_request, utc)
 
 DEFAULT_PRODUCT = "MultiSensor_QPE_01H_Pass2_00.00"
+DEFAULT_PRODUCTS = (
+    "PrecipRate_00.00", "MergedReflectivityQCComposite_00.50",
+    "MergedAzShear_0-2kmAGL_00.50", DEFAULT_PRODUCT,
+)
 _GRID_COORDINATES = OrderedDict()
 _GRID_LOCK = threading.Lock()
 _ECCODES_NOTICE_LOCK = threading.Lock()
 _METADATA_TIME_KEYS = ("dataDate", "dataTime", "validityDate", "validityTime")
 # NOAA's GRIB2 tables: https://www.nssl.noaa.gov/projects/mrms/operational/tables.php
 PRODUCTS = {
-    DEFAULT_PRODUCT: {"unit": "mm", "missing": -1, "no_coverage": -3, "interval_minutes": 60},
-    "MultiSensor_QPE_01H_Pass1_00.00": {"unit": "mm", "missing": -1, "no_coverage": -3, "interval_minutes": 60},
-    "RadarOnly_QPE_01H_00.00": {"unit": "mm", "missing": -1, "no_coverage": -3, "interval_minutes": 60},
-    "PrecipRate_00.00": {"unit": "mm h-1", "missing": -1, "no_coverage": -3, "interval_minutes": 0},
-    "MergedReflectivityQCComposite_00.50": {"unit": "dBZ", "missing": -99, "no_coverage": -999, "interval_minutes": 0},
-    "MergedBaseReflectivityQC_00.50": {"unit": "dBZ", "missing": -99, "no_coverage": -999, "interval_minutes": 0},
+    DEFAULT_PRODUCT: {"unit": "mm", "missing": -1, "no_coverage": -3,
+                      "frequency_minutes": 60, "accumulation_minutes": 60, "interval_minutes": 60},
+    "MultiSensor_QPE_01H_Pass1_00.00": {"unit": "mm", "missing": -1, "no_coverage": -3,
+                      "frequency_minutes": 60, "accumulation_minutes": 60, "interval_minutes": 60},
+    # RadarOnly QPE is a rolling one-hour accumulation updated every two minutes.
+    "RadarOnly_QPE_01H_00.00": {"unit": "mm", "missing": -1, "no_coverage": -3,
+                      "frequency_minutes": 2, "accumulation_minutes": 60, "interval_minutes": 60},
+    "PrecipRate_00.00": {"unit": "mm h-1", "missing": -1, "no_coverage": -3,
+                      "frequency_minutes": 2, "accumulation_minutes": 0, "interval_minutes": 0},
+    "MergedReflectivityQCComposite_00.50": {"unit": "dBZ", "missing": -99, "no_coverage": -999,
+                      "frequency_minutes": 2, "accumulation_minutes": 0, "interval_minutes": 0},
+    "MergedBaseReflectivityQC_00.50": {"unit": "dBZ", "missing": -99, "no_coverage": -999,
+                      "frequency_minutes": 2, "accumulation_minutes": 0, "interval_minutes": 0},
+    # NOAA encodes no coverage and missing for these fields as zero; retain the
+    # bitmap and never infer coverage from a zero value alone.
+    "MergedAzShear_0-2kmAGL_00.50": {"unit": "0.001 s-1", "missing": 0,
+        "no_coverage": 0, "frequency_minutes": 2, "accumulation_minutes": 0,
+        "interval_minutes": 0, "zero_ambiguous": True},
+    "MergedAzShear_3-6kmAGL_00.50": {"unit": "0.001 s-1", "missing": 0,
+        "no_coverage": 0, "frequency_minutes": 2, "accumulation_minutes": 0,
+        "interval_minutes": 0, "zero_ambiguous": True},
+}
+
+# Human-facing CLI names. Archives, selections, and metadata keep NOAA's exact
+# product key so their source identity stays explicit.
+PRODUCT_ALIASES = {
+    "precipitation-rate": "PrecipRate_00.00",
+    "composite-reflectivity": "MergedReflectivityQCComposite_00.50",
+    "base-reflectivity": "MergedBaseReflectivityQC_00.50",
+    "radar-only-qpe-1h": "RadarOnly_QPE_01H_00.00",
+    "low-level-azimuthal-shear": "MergedAzShear_0-2kmAGL_00.50",
+    "mid-level-azimuthal-shear": "MergedAzShear_3-6kmAGL_00.50",
+    "multisensor-qpe-pass1": "MultiSensor_QPE_01H_Pass1_00.00",
+    "multisensor-qpe-pass2": "MultiSensor_QPE_01H_Pass2_00.00",
+}
+PRODUCT_ARGUMENTS = {
+    **PRODUCT_ALIASES,
+    **{product: product for product in PRODUCTS},
 }
 
 
-def match_hours(assets, expected_times, tolerance_minutes=5, method="previous"):
-    """Assign at most one real observation to each hourly slot, without reusing it.
+def parse_product_argument(value):
+    """Resolve a readable CLI name or an exact NOAA key to the NOAA key."""
+    from argparse import ArgumentTypeError
 
-    Previous uses only observations at or before the slot. Nearest is explicit
-    opt-in and may use a later observation; offsets remain part of the manifest.
-    """
-    if not 0 <= tolerance_minutes < 30 or method not in {"previous", "nearest", "exact"}:
-        raise ValueError("Use a tolerance from 0 to under 30 minutes and previous, nearest, or exact matching.")
+    product = PRODUCT_ARGUMENTS.get(value.lower(), PRODUCT_ARGUMENTS.get(value))
+    if product is None:
+        options = ", ".join(PRODUCT_ALIASES)
+        raise ArgumentTypeError(f"unknown MRMS product {value!r}; choose: {options}")
+    return product
+
+
+def match_slots(assets, expected_times, tolerance_minutes=5, method="previous", cadence_minutes=10):
+    """Assign at most one source observation per requested slot, without reuse."""
+    if (cadence_minutes < 1 or not 0 <= tolerance_minutes <= cadence_minutes / 2
+            or method not in {"previous", "nearest", "exact"}):
+        raise ValueError("Use a tolerance no greater than half the cadence and previous, nearest, or exact matching.")
     tolerance = timedelta(minutes=0 if method == "exact" else tolerance_minutes)
     assets = sorted(assets, key=lambda a: (a.time, a.key))
     times = [utc(a.time) for a in assets]
@@ -60,6 +107,11 @@ def match_hours(assets, expected_times, tolerance_minutes=5, method="previous"):
     return chosen, tuple(matches)
 
 
+def match_hours(assets, expected_times, tolerance_minutes=5, method="previous"):
+    """Backward-compatible matcher for hourly products."""
+    return match_slots(assets, expected_times, tolerance_minutes, method, cadence_minutes=60)
+
+
 def discover(start, end, bbox=PR_BBOX, product=DEFAULT_PRODUCT, tolerance_minutes=5, time_match="previous"):
     start, end, bbox = validate_request(start, end, bbox)
     if product not in PRODUCTS:
@@ -67,10 +119,11 @@ def discover(start, end, bbox=PR_BBOX, product=DEFAULT_PRODUCT, tolerance_minute
     if not (-90 <= bbox[0] < bbox[2] <= -60 and 10 <= bbox[1] < bbox[3] <= 25):
         raise ValueError("The region must fit within the CARIB grid (-90 to -60 longitude, 10 to 25 latitude).")
     client, assets = s3_client(), []
-    hourly = product.startswith("MultiSensor_QPE_01H")
+    hourly = PRODUCTS[product]["frequency_minutes"] == 60
+    cadence_minutes = 60 if hourly else 10
     # Check matching parameters before making any network request.
-    match_hours([], [], tolerance_minutes, time_match)
-    lookup_start = start-timedelta(minutes=tolerance_minutes) if hourly else start
+    match_slots([], [], tolerance_minutes, time_match, cadence_minutes=cadence_minutes)
+    lookup_start = start-timedelta(minutes=tolerance_minutes)
     dates = sorted({h.strftime("%Y%m%d") for h in hours(lookup_start, end)})
     for date in dates:
         prefix = f"CARIB/{product}/{date}/"
@@ -85,13 +138,21 @@ def discover(start, end, bbox=PR_BBOX, product=DEFAULT_PRODUCT, tolerance_minute
                 assets.append(Asset("noaa-mrms-pds", key, obj["Size"], obj["ETag"].strip('"'), iso(when)))
     assets.sort(key=lambda a: (a.time, a.key))
     # Exact clock hours are expected only for the two multisensor hourly products.
-    expected = tuple(iso(h) for h in hours(start, end) if h >= start) if hourly else ()
+    expected = tuple(iso(h) for h in (hours(start, end) if hourly else time_slots(start, end, cadence_minutes)))
     matches = ()
-    if hourly:
-        assets, matches = match_hours(assets, expected, tolerance_minutes, time_match)
+    assets, matches = match_slots(assets, expected, tolerance_minutes, time_match,
+                                  cadence_minutes=cadence_minutes)
     return Selection("mrms", product, iso(start), iso(end), bbox, assets, expected_times=expected,
-                     hourly_matches=matches, time_tolerance_minutes=tolerance_minutes if hourly else 0,
-                     time_match=time_match if hourly else "exact")
+                     hourly_matches=matches, time_tolerance_minutes=tolerance_minutes,
+                     time_match=time_match, cadence_minutes=cadence_minutes)
+
+
+def discover_defaults(start, end, bbox=PR_BBOX, products=DEFAULT_PRODUCTS,
+                      tolerance_minutes=5, time_match="previous"):
+    """Discover default fast radar fields and retain slow QPE at native cadence."""
+    return [discover(start, end, bbox=bbox, product=product,
+                     tolerance_minutes=tolerance_minutes, time_match=time_match)
+            for product in products]
 
 
 @contextlib.contextmanager
@@ -202,13 +263,42 @@ def read(asset: Asset, bbox=PR_BBOX, product=DEFAULT_PRODUCT, transport=None, ha
         with Transport() as owned:
             return read(asset, bbox, product, owned, halo)
     before = time.perf_counter()
-    compressed = transport.read(asset)
-    if len(compressed) != asset.size:
-        raise IOError("Source size changed or the download is incomplete.")
+    compressed = payload = None
+    failure = None
+    for attempt in range(3):
+        try:
+            candidate = transport.read(asset)
+            if len(candidate) != asset.size:
+                raise IOError(f"received {len(candidate)} of {asset.size} listed bytes")
+            # S3 ETags for these small, single-part NOAA objects are MD5 hashes.
+            # Only enforce the comparison when the ETag has that exact form.
+            if len(asset.etag) == 32 and all(c in "0123456789abcdefABCDEF" for c in asset.etag):
+                actual = hashlib.md5(candidate, usedforsecurity=False).hexdigest()
+                if actual.lower() != asset.etag.lower():
+                    raise IOError(f"ETag mismatch (received MD5 {actual})")
+            decoded = gzip.decompress(candidate)
+            declared = int.from_bytes(decoded[8:16], "big") if len(decoded) >= 16 else -1
+            if decoded[:4] != b"GRIB" or declared != len(decoded):
+                raise ValueError(f"not one complete GRIB2 message (decompressed {len(decoded)} bytes, "
+                                 f"declared {declared}, magic {decoded[:4].hex()})")
+            compressed, payload = candidate, decoded
+            break
+        except (OSError, EOFError, ValueError, zlib.error) as exc:
+            failure = exc
+            if attempt < 2:
+                time.sleep(0.25 * (attempt + 1))
     transfer = time.perf_counter() - before
+    if compressed is None:
+        raise IOError(f"Source integrity check failed after 3 reads for {asset.key} "
+                      f"(listed size {asset.size}, ETag {asset.etag}): {failure}") from failure
     with transport.decode_slots:
         before = time.perf_counter()
-        raw = decode_grib(gzip.decompress(compressed), product)
+        try:
+            raw = decode_grib(payload, product)
+        except ValueError as exc:
+            raise ValueError(f"Invalid GRIB payload for {asset.key} "
+                             f"(ETag {asset.etag}, compressed={len(compressed)}, "
+                             f"decompressed={len(payload)} bytes): {exc}") from exc
         subset = (raw if bbox is None else crop_native(raw, bbox, halo=halo)).copy(deep=True)
         decoding = time.perf_counter() - before
     subset.attrs.update(source_url=asset.url, source_etag=asset.etag, observation_time=asset.time,

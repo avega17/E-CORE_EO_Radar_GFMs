@@ -20,8 +20,11 @@ def classify(ds, variable):
         from .mrms import PRODUCTS
         info = PRODUCTS[ds.attrs["product"]]
         physical = raw
-        codes = xr.where(raw == info["missing"], 1, codes)
-        codes = xr.where(raw == info["no_coverage"], 2, codes)
+        if info.get("zero_ambiguous"):
+            codes = xr.where(raw == 0, 7, codes)
+        else:
+            codes = xr.where(raw == info["missing"], 1, codes)
+            codes = xr.where(raw == info["no_coverage"], 2, codes)
         codes = xr.where(~np.isfinite(raw), 4, codes)
         codes = xr.where(ds.bitmap_valid == 0, 3, codes)
     else:
@@ -37,12 +40,13 @@ def classify(ds, variable):
         if fill is not None:
             codes = xr.where(raw == fill, 1, codes)
         codes = xr.where(~np.isfinite(raw), 4, codes)
-    codes.attrs["classes"] = "0 valid; 1 missing/fill; 2 no coverage; 3 bitmap missing; 4 NaN/Inf; 5 quality flag; 6 outside valid range"
+    codes.attrs["classes"] = "0 valid; 1 missing/fill; 2 no coverage; 3 bitmap missing; 4 NaN/Inf; 5 quality flag; 6 outside valid range; 7 ambiguous shear zero"
     return codes, physical
 
 
 CLASS_NAMES = {0: "valid", 1: "missing_fill", 2: "no_coverage", 3: "bitmap_missing",
-               4: "nonfinite", 5: "quality_flag", 6: "outside_valid_range"}
+               4: "nonfinite", 5: "quality_flag", 6: "outside_valid_range",
+               7: "ambiguous_shear_zero"}
 
 
 def _patch_mask(ds, bbox):
@@ -118,8 +122,8 @@ def plot_maps(ds, variable=None):
         plot_coords["longitude"] = (physical.longitude + 180) % 360 - 180
     raw_label = f"Raw value ({physical.attrs.get('units', '')})" if radar else "Packed pixel value"
     ds[variable].assign_coords(plot_coords).plot(ax=axes[0], cbar_kwargs={"label": raw_label})
-    codes.assign_coords(plot_coords).plot(ax=axes[1], levels=np.arange(-.5, 7.5), cmap="tab10",
-                                          cbar_kwargs={"label": "Pixel class", "ticks": range(7)})
+    codes.assign_coords(plot_coords).plot(ax=axes[1], levels=np.arange(-.5, 8.5), cmap="tab10",
+                                          cbar_kwargs={"label": "Pixel class", "ticks": range(8)})
     # Packed GOES coordinates are decoded along with the measurements. Transfer
     # the pixel mask positionally rather than aligning packed to physical axes.
     mask = xr.DataArray(codes.values == 0, dims=physical.dims, coords=physical.coords)
